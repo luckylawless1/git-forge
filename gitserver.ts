@@ -314,14 +314,24 @@ function fetchV2(repo: Repo, args: V2Args): Buffer {
   const store = repo.objects;
   const plan = planFetch(repo, args);
   const parts: Buffer[] = [];
-  // acknowledgments: ACK the haves the store knows as commits, NAK when none, ready when done.
-  const ackLines: (string | 'delim')[] = ['acknowledgments\n'];
-  const common = args.haves.filter((oid) => store.get(oid)?.type === 'commit');
-  if (common.length === 0) ackLines.push('NAK\n');
-  else for (const oid of common) ackLines.push(`ACK ${oid}\n`);
-  if (args.done) ackLines.push('ready\n');
-  ackLines.push('delim');
-  parts.push(encodePktLines(ackLines));
+  // The acknowledgment dance, exactly as upload-pack plays it (verified against git 2.43):
+  // haves with a common commit -> ACKs + "ready", then the pack in the same response; haves with
+  // nothing in common and no "done" -> a lone NAK section while negotiation continues; no haves,
+  // or nothing in common but "done" -> no acknowledgments section at all, straight to the pack.
+  if (args.haves.length > 0) {
+    const common = args.haves.filter((oid) => store.get(oid)?.type === 'commit');
+    if (common.length === 0 && !args.done) {
+      const nak = encodePktLines(['acknowledgments\n', 'NAK\n', 'delim']);
+      return Buffer.concat([nak, Buffer.from('0000', 'ascii')]);
+    }
+    if (common.length > 0) {
+      const ackLines: (string | 'delim')[] = ['acknowledgments\n'];
+      for (const oid of common) ackLines.push(`ACK ${oid}\n`);
+      ackLines.push('ready\n');
+      ackLines.push('delim');
+      parts.push(encodePktLines(ackLines));
+    }
+  }
   if (plan.shallow.length || plan.unshallow.length) {
     const shallowLines: (string | 'delim')[] = ['shallow-info\n'];
     for (const oid of plan.shallow) shallowLines.push(`shallow ${oid}\n`);

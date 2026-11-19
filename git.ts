@@ -532,15 +532,13 @@ export function readPack(
 }
 
 /**
- * The number of bytes the zlib stream starting at `at` occupies. Found by inflating with a raw
- * stream and tracking consumed bytes through `inflateSync` on progressively larger windows is
- * wasteful; instead use the fact that Node reports nothing — so scan with a streaming inflate.
+ * The number of bytes the zlib stream starting at `at` occupies. Node's sync inflate does not
+ * report how many input bytes it consumed, so the length is found by binary search (below).
  */
 function compressedLength(pack: Buffer, at: number, expectedPlain: number): number {
   // A zlib stream is self-terminating. Binary-search the smallest window whose inflate succeeds
-  // and yields exactly the expected plaintext: correct, and fast enough for forge-sized packs.
-  let lo = 1;
-  let hi = pack.length - at;
+  // and yields exactly the expected plaintext. The search starts from a tight upper bound — a
+  // stored/deflated stream is never much larger than its plaintext — and only widens if needed.
   const works = (length: number): boolean => {
     try {
       const out = inflateSync(pack.subarray(at, at + length), { maxOutputLength: expectedPlain + 1 });
@@ -549,7 +547,12 @@ function compressedLength(pack: Buffer, at: number, expectedPlain: number): numb
       return false;
     }
   };
-  if (!works(hi)) throw new Error('pack zlib stream does not terminate inside the pack');
+  let hi = Math.min(pack.length - at, expectedPlain + 64 + (expectedPlain >> 3));
+  if (!works(hi)) {
+    hi = pack.length - at;
+    if (!works(hi)) throw new Error('pack zlib stream does not terminate inside the pack');
+  }
+  let lo = 1;
   while (lo < hi) {
     const mid = (lo + hi) >> 1;
     if (works(mid)) hi = mid;
