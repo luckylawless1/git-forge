@@ -242,25 +242,26 @@ export function buildTree(entries: readonly TreeEntry[]): Buffer {
 }
 
 /** Flatten a tree (recursively) into a map of path -> {mode, oid} for files (blobs) only. */
-export function flattenTree(store: ObjectStore, treeOid: string, prefix = '', out = new Map<string, { mode: string; oid: string }>()): Map<string, { mode: string; oid: string }> {
+/** Flatten a tree into a path -> blob oid map (the forge's files are mode 100644 throughout). */
+export function flattenTree(store: ObjectStore, treeOid: string, prefix = '', out = new Map<string, string>()): Map<string, string> {
   const tree = store.get(treeOid);
   if (!tree || tree.type !== 'tree') return out;
   for (const entry of parseTree(tree.data)) {
     const path = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
     if (entry.mode === '40000') flattenTree(store, entry.oid, path, out);
-    else out.set(path, { mode: entry.mode, oid: entry.oid });
+    else out.set(path, entry.oid);
   }
   return out;
 }
 
-/** Build nested trees from a flat path -> {mode, oid} map; returns the root tree's oid. */
-export function buildTreeFromFiles(store: ObjectStore, files: ReadonlyMap<string, { mode: string; oid: string }>): string {
+/** Build nested trees from a flat path -> blob oid map (all files mode 100644); returns the root tree oid. */
+export function buildTreeFromFiles(store: ObjectStore, files: ReadonlyMap<string, string>): string {
   interface Dir {
-    files: Map<string, { mode: string; oid: string }>;
+    files: Map<string, string>;
     dirs: Map<string, Dir>;
   }
   const root: Dir = { files: new Map(), dirs: new Map() };
-  for (const [path, file] of files) {
+  for (const [path, oid] of files) {
     const parts = path.split('/');
     let dir = root;
     for (let i = 0; i < parts.length - 1; i += 1) {
@@ -271,11 +272,11 @@ export function buildTreeFromFiles(store: ObjectStore, files: ReadonlyMap<string
       }
       dir = next;
     }
-    dir.files.set(parts[parts.length - 1], file);
+    dir.files.set(parts[parts.length - 1], oid);
   }
   const build = (dir: Dir): string => {
     const entries: TreeEntry[] = [];
-    for (const [name, file] of dir.files) entries.push({ mode: file.mode, name, oid: file.oid });
+    for (const [name, oid] of dir.files) entries.push({ mode: '100644', name, oid });
     for (const [name, child] of dir.dirs) entries.push({ mode: '40000', name, oid: build(child) });
     return store.put('tree', buildTree(entries));
   };

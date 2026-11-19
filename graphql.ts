@@ -1146,10 +1146,16 @@ def('Commit', {
   message: (s) => commitOf(s).message,
   messageHeadline: (s) => commitOf(s).message.split('\n')[0],
   messageBody: (s) => commitOf(s).message.split('\n').slice(1).join('\n').trim(),
-  committedDate: (s) => isoOf(new Date(commitOf(s).committer.epoch * 1000)),
-  authoredDate: (s) => isoOf(new Date(commitOf(s).author.epoch * 1000)),
-  author: (s) => actorOf(commitOf(s).author),
-  committer: (s) => actorOf(commitOf(s).committer),
+  committedDate: (s) => isoOf(new Date(commitOf(s).committerEpoch * 1000)),
+  authoredDate: (s) => isoOf(new Date(commitOf(s).authorEpoch * 1000)),
+  author: (s) => {
+    const commit = commitOf(s);
+    return actorOf({ name: commit.authorName, email: commit.authorEmail, epoch: commit.authorEpoch });
+  },
+  committer: (s) => {
+    const commit = commitOf(s);
+    return actorOf({ name: commit.committerName, email: commit.committerEmail, epoch: commit.committerEpoch });
+  },
   tree: (s) => treeValue(s.repo as Repo, commitOf(s).tree),
   treeOid: (s) => commitOf(s).tree,
   parents: (s, args) => {

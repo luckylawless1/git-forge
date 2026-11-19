@@ -185,17 +185,23 @@ interface FetchPlan {
  */
 function planFetch(repo: Repo, args: V2Args): FetchPlan {
   const store = repo.objects;
-  const exclude = collectReachable(store, args.haves);
-  for (const not of args.deepenNot) collectReachable(store, [not], exclude);
-  // The client's shallow commits: it holds the commit and its tree, but not its parents.
+  // The client's shallow commits: it holds the commit and its tree, but not its parents — so a
+  // shallow commit listed as a have excludes only itself and its tree, never its ancestors.
   const clientShallow = new Set(args.shallow.filter((oid) => store.has(oid)));
-  for (const oid of clientShallow) {
+  const exclude = new Set<string>();
+  const excludeShallowCommit = (oid: string): void => {
     const commit = store.get(oid);
     if (commit?.type === 'commit') {
       exclude.add(oid);
       collectReachable(store, [parseCommit(commit.data).tree], exclude);
     }
+  };
+  for (const have of args.haves) {
+    if (clientShallow.has(have)) excludeShallowCommit(have);
+    else collectReachable(store, [have], exclude);
   }
+  for (const oid of clientShallow) if (!exclude.has(oid)) excludeShallowCommit(oid);
+  for (const not of args.deepenNot) collectReachable(store, [not], exclude);
   const depth = args.deepen;
   const since = args.deepenSince;
   if (depth === null && since === null) {

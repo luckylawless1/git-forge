@@ -202,8 +202,8 @@ export function commitJson(repo: Repo, sha: string): Json | null {
     sha,
     node_id: nodeId('Commit', sha),
     commit: {
-      author: { name: commit.author.name, email: commit.author.email, date: isoOf(new Date(commit.author.epoch * 1000)) },
-      committer: { name: commit.committer.name, email: commit.committer.email, date: isoOf(new Date(commit.committer.epoch * 1000)) },
+      author: { name: commit.authorName, email: commit.authorEmail, date: isoOf(new Date(commit.authorEpoch * 1000)) },
+      committer: { name: commit.committerName, email: commit.committerEmail, date: isoOf(new Date(commit.committerEpoch * 1000)) },
       message: commit.message,
       tree: { sha: commit.tree, url: `${api}/git/trees/${commit.tree}` },
       url: `${api}/git/commits/${sha}`,

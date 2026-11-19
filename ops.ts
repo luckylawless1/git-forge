@@ -5,8 +5,8 @@ import {
   buildCommit,
   buildTreeFromFiles,
   flattenTree,
+  formatIdent,
   parseCommit,
-  type Ident,
 } from './git.ts';
 import { planMerge } from './diff.ts';
 import {
@@ -19,22 +19,18 @@ import {
   type Repo,
 } from './store.ts';
 
-export function viewerIdent(): Ident {
-  return { name: VIEWER_NAME, email: VIEWER_EMAIL, epoch: Math.floor(Date.now() / 1000), tz: '+0000' };
+/** The viewer's ident line for REST/GraphQL/MCP-created commits, at the current time. */
+export function viewerIdentLine(): string {
+  return formatIdent(VIEWER_NAME, VIEWER_EMAIL, Math.floor(Date.now() / 1000));
 }
 
 /** Commit a whole file map onto a branch ref and return the new commit oid. */
 export function commitFiles(repo: Repo, ref: string, files: Map<string, string>, message: string): string {
   const tree = buildTreeFromFiles(repo.objects, files);
   const tip = repo.refs.get(ref);
-  const ident = viewerIdent();
-  const sha = buildCommit(repo.objects, {
-    tree,
-    parents: tip ? [tip] : [],
-    author: ident,
-    committer: ident,
-    message,
-  });
+  const ident = viewerIdentLine();
+  const data = buildCommit({ tree, parents: tip ? [tip] : [], author: ident, committer: ident, message });
+  const sha = repo.objects.put('commit', data);
   repo.refs.set(ref, sha);
   repo.updatedAt = nowDate();
   return sha;
@@ -103,14 +99,15 @@ export function mergePull(repo: Repo, pr: IssueRec): MergeOutcome {
   if (!plan.headTip || !plan.baseTip) return { ok: false, reason: 'missing-ref' };
   if (!plan.mergeable || !plan.treeFiles) return { ok: false, reason: 'conflict' };
   const tree = buildTreeFromFiles(repo.objects, plan.treeFiles);
-  const ident = viewerIdent();
-  const sha = buildCommit(repo.objects, {
+  const ident = viewerIdentLine();
+  const data = buildCommit({
     tree,
     parents: [plan.baseTip],
     author: ident,
     committer: ident,
     message: `${pr.title} (#${pr.number})`,
   });
+  const sha = repo.objects.put('commit', data);
   repo.refs.set(`refs/heads/${pr.pull.baseRef}`, sha);
   repo.updatedAt = nowDate();
   const now = nowDate();

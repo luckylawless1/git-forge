@@ -346,6 +346,8 @@ function contentRoutes(req: RestRequest, repo: Repo, path: string): RestResult {
           git_url: `${api}/git/blobs/${blob}`,
           download_url: `${req.base}/${repo.fullName}/raw/${branch}/${path}`,
           type: 'file',
+          encoding: 'base64',
+          content: (repo.objects.get(blob)?.data ?? Buffer.alloc(0)).toString('base64'),
           _links: { self: `${api}/contents/${path}`, git: `${api}/git/blobs/${blob}`, html: `${req.base}/${repo.fullName}/blob/${branch}/${path}` },
         },
         commit: commit?.commit ? { ...commit.commit, sha: commitSha, url: `${api}/git/commits/${commitSha}`, html_url: `${req.base}/${repo.fullName}/commit/${commitSha}` } : { sha: commitSha },

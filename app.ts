@@ -4,7 +4,7 @@
 // token's login does not exist. Malformed requests answer JSON errors — the server never crashes
 // on bad input.
 
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 
 import { infoRefs, receivePack, uploadPackV0, uploadPackV2 } from './gitserver.ts';
 import { handleGraphQL } from './graphql.ts';
@@ -12,11 +12,6 @@ import { handleMcp } from './mcp.ts';
 import { handleRest, type RestResult } from './rest.ts';
 import { setBase } from './serialize.ts';
 import { forge } from './store.ts';
-
-export interface ForgeApp {
-  listen(port: number): Promise<{ port: number }>;
-  close(): Promise<void>;
-}
 
 /** Kept from the starter's shape: the environment probes GET /healthz over HTTP. */
 export function setPortProbe(_probe: unknown): void {
@@ -157,7 +152,8 @@ async function dispatch(req: IncomingMessage, body: Buffer): Promise<Reply> {
   return notFound();
 }
 
-export async function createApp(): Promise<ForgeApp> {
+/** Build the forge's HTTP server; main.ts binds it to an ephemeral port itself. */
+export function createApp(): Server {
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       const requestId = nextRequestId();
@@ -186,20 +182,5 @@ export async function createApp(): Promise<ForgeApp> {
   // request timeout cut it.
   server.requestTimeout = 0;
   server.headersTimeout = 60_000;
-  return {
-    listen(port: number): Promise<{ port: number }> {
-      return new Promise((resolve, reject) => {
-        server.once('error', reject);
-        server.listen(port, '127.0.0.1', () => {
-          const address = server.address();
-          resolve({ port: typeof address === 'object' && address ? address.port : port });
-        });
-      });
-    },
-    close(): Promise<void> {
-      return new Promise((resolve) => {
-        server.close(() => resolve());
-      });
-    },
-  };
+  return server;
 }
