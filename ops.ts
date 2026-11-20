@@ -2,6 +2,7 @@
 // so an object made over REST is the same object GraphQL and MCP see, with the same ids.
 
 import {
+  ZERO_OID,
   buildCommit,
   buildTreeFromFiles,
   flattenTree,
@@ -9,6 +10,7 @@ import {
   parseCommit,
 } from './git.ts';
 import { planMerge } from './diff.ts';
+import { recordCommentEvent, recordIssueEvent, recordRefUpdate } from './events.ts';
 import {
   VIEWER_EMAIL,
   VIEWER_LOGIN,
@@ -25,7 +27,7 @@ export function viewerIdentLine(): string {
 }
 
 /** Commit a whole file map onto a branch ref and return the new commit oid. */
-export function commitFiles(repo: Repo, ref: string, files: Map<string, string>, message: string): string {
+export function commitFiles(forge: Forge, repo: Repo, ref: string, files: Map<string, string>, message: string): string {
   const tree = buildTreeFromFiles(repo.objects, files);
   const tip = repo.refs.get(ref);
   const ident = viewerIdentLine();
@@ -33,6 +35,7 @@ export function commitFiles(repo: Repo, ref: string, files: Map<string, string>,
   const sha = repo.objects.put('commit', data);
   repo.refs.set(ref, sha);
   repo.updatedAt = nowDate();
+  recordRefUpdate(forge, repo, ref, tip ?? ZERO_OID, sha);
   return sha;
 }
 
@@ -45,7 +48,7 @@ export function branchFiles(repo: Repo, ref: string): Map<string, string> {
   return flattenTree(repo.objects, parseCommit(object.data).tree);
 }
 
-export function createIssueRecord(
+function makeIssueRecord(
   forge: Forge,
   repo: Repo,
   input: { title: string; body?: string | null; labels?: string[] },
@@ -69,21 +72,33 @@ export function createIssueRecord(
   return rec;
 }
 
+export function createIssueRecord(
+  forge: Forge,
+  repo: Repo,
+  input: { title: string; body?: string | null; labels?: string[] },
+): IssueRec {
+  const rec = makeIssueRecord(forge, repo, input);
+  recordIssueEvent(forge, repo, 'opened', rec);
+  return rec;
+}
+
 export function createPullRecord(
   forge: Forge,
   repo: Repo,
   input: { title: string; body?: string | null; head: string; base: string },
 ): IssueRec {
-  const rec = createIssueRecord(forge, repo, input);
+  const rec = makeIssueRecord(forge, repo, input);
   rec.pull = { headRef: input.head, baseRef: input.base, merged: false, mergedAt: null, mergeCommitSha: null };
+  recordIssueEvent(forge, repo, 'opened', rec);
   return rec;
 }
 
-export function addCommentRecord(forge: Forge, issue: IssueRec, body: string): IssueRec['comments'][number] {
+export function addCommentRecord(forge: Forge, repo: Repo, issue: IssueRec, body: string): IssueRec['comments'][number] {
   const now = nowDate();
   const comment = { id: forge.newCommentId(), body, userLogin: VIEWER_LOGIN, createdAt: now, updatedAt: now };
   issue.comments.push(comment);
   issue.updatedAt = now;
+  recordCommentEvent(forge, repo, issue, comment.id);
   return comment;
 }
 
@@ -92,7 +107,7 @@ export type MergeOutcome =
   | { ok: false; reason: 'conflict' | 'already-merged' | 'missing-ref' };
 
 /** Squash-merge a pull request onto its base branch: one commit, the head's changes, base parent. */
-export function mergePull(repo: Repo, pr: IssueRec): MergeOutcome {
+export function mergePull(forge: Forge, repo: Repo, pr: IssueRec): MergeOutcome {
   if (!pr.pull) return { ok: false, reason: 'missing-ref' };
   if (pr.pull.merged) return { ok: false, reason: 'already-merged' };
   const plan = planMerge(repo, pr.pull.headRef, pr.pull.baseRef);
@@ -117,5 +132,7 @@ export function mergePull(repo: Repo, pr: IssueRec): MergeOutcome {
   pr.state = 'closed';
   pr.closedAt = now;
   pr.updatedAt = now;
+  recordRefUpdate(forge, repo, `refs/heads/${pr.pull.baseRef}`, plan.baseTip, sha);
+  recordIssueEvent(forge, repo, 'closed', pr);
   return { ok: true, sha };
 }

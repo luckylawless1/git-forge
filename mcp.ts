@@ -190,7 +190,7 @@ const TOOLS: ToolDef[] = [
       const repo = needRepo(args);
       const rec = repo.issues.get(needNumber(args, ['issue_number', 'number']));
       if (!rec) throw new ToolError('issue not found');
-      const comment = addCommentRecord(forge, rec, needString(args, 'body'));
+      const comment = addCommentRecord(forge, repo, rec, needString(args, 'body'));
       return { id: comment.id, body: comment.body, issue_number: rec.number };
     },
   },
@@ -292,7 +292,7 @@ const TOOLS: ToolDef[] = [
       const repo = needRepo(args);
       const rec = repo.issues.get(needNumber(args, ['pull_number', 'number']));
       if (!rec?.pull) throw new ToolError('pull request not found');
-      const outcome = mergePull(repo, rec);
+      const outcome = mergePull(forge, repo, rec);
       if (!outcome.ok) {
         if (outcome.reason === 'already-merged') throw new ToolError('pull request is already merged');
         if (outcome.reason === 'conflict') throw new ToolError('pull request is not mergeable: it conflicts with the base branch');

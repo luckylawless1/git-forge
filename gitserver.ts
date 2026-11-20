@@ -2,6 +2,8 @@
 // with shallow/deepen support) and receive-pack (push, v0, fast-forward only, per-ref report).
 // Repositories are created through REST; a push to a missing repository is a 404 on info/refs.
 
+import { createHash } from 'node:crypto';
+
 import {
   ZERO_OID,
   collectReachable,
@@ -16,9 +18,37 @@ import {
   writePack,
   type GitObject,
 } from './git.ts';
-import type { Repo } from './store.ts';
+import { recordRefUpdate } from './events.ts';
+import { forge, type Repo } from './store.ts';
 
 const AGENT = 'git-forge/1.0.0';
+
+/**
+ * Fetch answers are a pure function of the request body and the repository's state, and clone
+ * workloads repeat one identical fetch dozens of times concurrently. Memoise the finished
+ * response bytes on (body hash, state fingerprint); the fingerprint carries every ref tip and
+ * the object count, so a push — accepted or refused, both can grow the store — changes the key
+ * and no stale pack is ever served. Bounded: a full cache is dropped whole rather than evicted
+ * entry by entry (a clone burst re-fills it with its one hot key).
+ */
+const fetchCache = new Map<string, Buffer>();
+const FETCH_CACHE_MAX = 128;
+
+function fetchCacheKey(repo: Repo, body: Buffer): string {
+  const parts: string[] = [repo.headRef, String(repo.objects.objects.size)];
+  for (const name of [...repo.refs.keys()].sort()) parts.push(`${name}=${repo.refs.get(name)}`);
+  const bodyHash = createHash('sha256').update(body).digest('hex');
+  return `${bodyHash}|${parts.join('\n')}`;
+}
+
+function fetchCacheGet(repo: Repo, body: Buffer): Buffer | null {
+  return fetchCache.get(fetchCacheKey(repo, body)) ?? null;
+}
+
+function fetchCachePut(repo: Repo, body: Buffer, response: Buffer): void {
+  if (fetchCache.size >= FETCH_CACHE_MAX) fetchCache.clear();
+  fetchCache.set(fetchCacheKey(repo, body), response);
+}
 
 export interface GitResponse {
   status: number;
@@ -139,7 +169,11 @@ export function uploadPackV2(repo: Repo, body: Buffer): GitResponse {
     return { status: 200, contentType: 'application/x-git-upload-pack-result', body: lsRefs(repo, args) };
   }
   if (commandLine === 'command=fetch') {
-    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: fetchV2(repo, args) };
+    const cached = fetchCacheGet(repo, body);
+    if (cached) return { status: 200, contentType: 'application/x-git-upload-pack-result', body: cached };
+    const response = fetchV2(repo, args);
+    fetchCachePut(repo, body, response);
+    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: response };
   }
   return jsonError(400, 'Bad Request');
 }
@@ -347,6 +381,14 @@ function fetchV2(repo: Repo, args: V2Args): Buffer {
 
 /** POST git-upload-pack, protocol v0: wants/haves negotiation, then a sideband pack. */
 export function uploadPackV0(repo: Repo, body: Buffer): GitResponse {
+  const cached = fetchCacheGet(repo, body);
+  if (cached) return { status: 200, contentType: 'application/x-git-upload-pack-result', body: cached };
+  const response = uploadPackV0Fresh(repo, body);
+  if (response.status === 200) fetchCachePut(repo, body, response.body);
+  return response;
+}
+
+function uploadPackV0Fresh(repo: Repo, body: Buffer): GitResponse {
   let packets: ReturnType<typeof decodePktLines>['packets'];
   try {
     packets = decodePktLines(body).packets;
@@ -450,6 +492,7 @@ function applyCommand(repo: Repo, command: PushCommand): string | null {
   if (command.oldOid !== current) return 'stale info';
   if (command.newOid === ZERO_OID) {
     repo.refs.delete(command.ref);
+    recordRefUpdate(forge, repo, command.ref, current, ZERO_OID);
     return null;
   }
   if (!store.has(command.newOid)) return 'invalid object';
@@ -459,5 +502,6 @@ function applyCommand(repo: Repo, command: PushCommand): string | null {
     if (oldCommit && newCommit && !isAncestor(store, oldCommit, newCommit)) return 'non-fast-forward';
   }
   repo.refs.set(command.ref, command.newOid);
+  recordRefUpdate(forge, repo, command.ref, current, command.newOid);
   return null;
 }

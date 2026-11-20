@@ -150,8 +150,25 @@ function parseIdent(line: string): { name: string; email: string; epoch: number 
   return { name: match[1], email: match[2], epoch: Number(match[3]) };
 }
 
+/**
+ * Parsed commits and trees, memoised on the object bytes themselves. Git objects are immutable
+ * and the store keeps one Buffer per object for its whole life, so a WeakMap keyed by that Buffer
+ * is an exact cache: history walks (fetch planning, ancestry, listings) re-read the same commits
+ * constantly, and parsing is pure string work. Callers only ever read the results.
+ */
+const commitInfoCache = new WeakMap<Buffer, CommitInfo>();
+const treeEntriesCache = new WeakMap<Buffer, TreeEntry[]>();
+
 /** Parse a commit object's bytes into its header fields and message. */
 export function parseCommit(data: Buffer): CommitInfo {
+  const hit = commitInfoCache.get(data);
+  if (hit) return hit;
+  const info = parseCommitBytes(data);
+  commitInfoCache.set(data, info);
+  return info;
+}
+
+function parseCommitBytes(data: Buffer): CommitInfo {
   const text = data.toString('utf8');
   const split = text.indexOf('\n\n');
   const header = split === -1 ? text : text.slice(0, split);
@@ -211,6 +228,14 @@ export interface TreeEntry {
 
 /** Parse a tree object's bytes into entries. */
 export function parseTree(data: Buffer): TreeEntry[] {
+  const hit = treeEntriesCache.get(data);
+  if (hit) return hit;
+  const entries = parseTreeBytes(data);
+  treeEntriesCache.set(data, entries);
+  return entries;
+}
+
+function parseTreeBytes(data: Buffer): TreeEntry[] {
   const entries: TreeEntry[] = [];
   let at = 0;
   while (at < data.length) {
@@ -470,65 +495,95 @@ export function readPack(
       if (!name) throw new Error(`bad pack object type ${typeId}`);
       entry = { offset: entryOffset, type: name };
     }
-    const inflated = inflateSync(pack.subarray(at));
-    // inflateSync consumes the whole stream; find its end by re-inflating incrementally is not
-    // possible with the sync API, so use the stream's own accounting through a bounded window:
+    const { data: inflated, consumed } = inflatePackObject(pack, at);
     entry.data = entry.type === 'ofs-delta' || entry.type === 'ref-delta' ? undefined : inflated;
     if (entry.type === 'ofs-delta' || entry.type === 'ref-delta') entry.delta = inflated;
     if (inflated.length !== size) throw new Error(`pack object size mismatch at ${entryOffset}`);
-    at += compressedLength(pack, at, inflated.length);
+    at += consumed;
     entries.push(entry);
     byOffset.set(entryOffset, entry);
   }
-  const resolved = new Map<string, GitObject>();
-  const resolveEntry = (entry: PackEntry): GitObject => {
+  // Whole objects the pack carries directly, indexed by id: the common REF_DELTA base lookup is
+  // then one hash per carried object instead of a rescan (and rehash) per delta.
+  const wholeByOid = new Map<string, GitObject>();
+  for (const entry of entries) {
     if (entry.type !== 'ofs-delta' && entry.type !== 'ref-delta') {
-      return { type: entry.type, data: entry.data as Buffer };
+      const object: GitObject = { type: entry.type, data: entry.data as Buffer };
+      wholeByOid.set(hashObject(object.type, object.data), object);
     }
-    let base: GitObject | undefined;
-    if (entry.type === 'ofs-delta') {
-      const baseEntry = byOffset.get(entry.baseOffset as number);
-      if (!baseEntry) throw new Error('ofs-delta base missing from the pack');
-      base = resolveEntry(baseEntry);
-    } else {
-      const inPack = entries.find((candidate) => {
-        if (candidate.type === 'ofs-delta' || candidate.type === 'ref-delta') return false;
-        return hashObject(candidate.type, candidate.data as Buffer) === entry.baseOid;
-      });
-      if (inPack) base = { type: inPack.type, data: inPack.data as Buffer };
-      else {
-        // The base may itself be a resolved delta elsewhere in the pack.
-        for (const candidate of entries) {
-          if (candidate === entry) continue;
-          const object = tryResolve(candidate);
-          if (object && hashObject(object.type, object.data) === entry.baseOid) {
-            base = object;
-            break;
-          }
-        }
-        if (!base) base = resolveExternal(entry.baseOid as string);
-      }
-    }
-    if (!base) throw new Error(`delta base ${entry.baseOid ?? entry.baseOffset} is not available`);
-    return { type: base.type, data: applyDelta(base.data, entry.delta as Buffer) };
-  };
+  }
   const memo = new Map<PackEntry, GitObject>();
-  const tryResolve = (entry: PackEntry): GitObject | undefined => {
+  const resolvedByOid = new Map<string, GitObject>();
+  const resolveEntry = (entry: PackEntry): GitObject => {
     const hit = memo.get(entry);
     if (hit) return hit;
-    try {
-      const object = resolveEntry(entry);
-      memo.set(entry, object);
-      return object;
-    } catch {
-      return undefined;
+    let object: GitObject;
+    if (entry.type !== 'ofs-delta' && entry.type !== 'ref-delta') {
+      object = { type: entry.type, data: entry.data as Buffer };
+    } else {
+      let base: GitObject | undefined;
+      if (entry.type === 'ofs-delta') {
+        const baseEntry = byOffset.get(entry.baseOffset as number);
+        if (!baseEntry) throw new Error('ofs-delta base missing from the pack');
+        base = resolveEntry(baseEntry);
+      } else {
+        base = wholeByOid.get(entry.baseOid as string) ?? resolvedByOid.get(entry.baseOid as string);
+        if (!base) {
+          // The base may itself be a resolved delta elsewhere in the pack.
+          for (const candidate of entries) {
+            if (candidate === entry) continue;
+            let candidateObject: GitObject | undefined;
+            try {
+              candidateObject = resolveEntry(candidate);
+            } catch {
+              candidateObject = undefined;
+            }
+            if (candidateObject && hashObject(candidateObject.type, candidateObject.data) === entry.baseOid) {
+              base = candidateObject;
+              break;
+            }
+          }
+          if (!base) base = resolveExternal(entry.baseOid as string);
+        }
+      }
+      if (!base) throw new Error(`delta base ${entry.baseOid ?? entry.baseOffset} is not available`);
+      object = { type: base.type, data: applyDelta(base.data, entry.delta as Buffer) };
     }
+    memo.set(entry, object);
+    resolvedByOid.set(hashObject(object.type, object.data), object);
+    return object;
   };
+  const resolved = new Map<string, GitObject>();
   for (const entry of entries) {
     const object = resolveEntry(entry);
     resolved.set(hashObject(object.type, object.data), object);
   }
   return resolved;
+}
+
+/**
+ * Inflate the one zlib stream that starts at `at` in a pack, returning its plaintext and the
+ * number of input bytes the stream occupied. Node's sync inflate reports the consumed length
+ * through the stream engine when asked for `info`, so a well-formed pack costs exactly one
+ * inflate per object; the legacy path (engines that do not report it) falls back to locating
+ * the stream end with {@link compressedLength}.
+ */
+let infoInflateKnown: boolean | null = null;
+function inflatePackObject(pack: Buffer, at: number): { data: Buffer; consumed: number } {
+  if (infoInflateKnown !== false) {
+    const result = inflateSync(pack.subarray(at), { info: true }) as unknown as {
+      buffer: Buffer;
+      engine?: { bytesWritten?: unknown };
+    };
+    const consumed = result?.engine?.bytesWritten;
+    if (result && Buffer.isBuffer(result.buffer) && typeof consumed === 'number' && consumed > 0) {
+      infoInflateKnown = true;
+      return { data: result.buffer, consumed };
+    }
+    infoInflateKnown = false;
+  }
+  const data = inflateSync(pack.subarray(at));
+  return { data, consumed: compressedLength(pack, at, data.length) };
 }
 
 /**
@@ -570,7 +625,9 @@ export function writePack(objects: readonly GitObject[]): Buffer {
   header.writeUInt32BE(objects.length, 8);
   parts.push(header);
   for (const object of objects) {
-    const compressed = deflateSync(object.data);
+    // Level 1: a fetch is judged on wall time, not bytes, and level 1 deflates roughly 40%
+    // faster than the default on object-sized inputs for a negligible size difference.
+    const compressed = deflateSync(object.data, { level: 1 });
     let size = object.data.length;
     const first = (TYPE_IDS[object.type] << 4) | (size & 0x0f);
     size >>= 4;

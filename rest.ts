@@ -2,15 +2,30 @@
 // requests, in GitHub's shapes and status codes. A repository under any owner but the token's
 // login does not exist here (404, never 403).
 
-import { flattenTree, parseCommit, parseTree } from './git.ts';
+import {
+  ZERO_OID,
+  buildTreeFromFiles,
+  flattenTree,
+  formatIdent,
+  mergeBase,
+  parseCommit,
+  parseTree,
+  peelToCommit,
+} from './git.ts';
 import { diffTrees, planMerge } from './diff.ts';
-import { addCommentRecord, branchFiles, commitFiles, createIssueRecord, createPullRecord, mergePull } from './ops.ts';
+import { recordIssueEvent, recordRefUpdate } from './events.ts';
+import { addCommentRecord, branchFiles, commitFiles, createIssueRecord, createPullRecord, mergePull, viewerIdentLine } from './ops.ts';
 import {
   commentJson,
   commitJson,
+  eventJson,
+  gitCommitJson,
+  issueEventJson,
   issueJson,
   labelJson,
+  releaseJson,
   repoJson,
+  tagRefJson,
   userJson,
   viewerJson,
   type Json,
@@ -26,6 +41,8 @@ import {
 export interface RestResult {
   status: number;
   body?: unknown;
+  /** A pre-serialised JSON body, sent verbatim (the single-issue GET memo). */
+  raw?: Buffer;
   headers?: Record<string, string>;
 }
 
@@ -141,6 +158,16 @@ export function handleRest(req: RestRequest): RestResult {
   if (parts[0] === 'users' && parts.length === 2 && req.method === 'GET') {
     return parts[1] === VIEWER_LOGIN ? { status: 200, body: viewerJson() } : notFound();
   }
+  if (parts[0] === 'users' && parts.length === 3 && parts[2] === 'events' && req.method === 'GET') {
+    if (parts[1] !== VIEWER_LOGIN) return notFound();
+    const mine = [...forge.events].reverse();
+    const { page, headers } = paginate(req, mine, `/api/v3/users/${VIEWER_LOGIN}/events`);
+    return {
+      status: 200,
+      body: page.map((event) => eventJson(forge.repos.get(event.repoFullName) ?? null, event)),
+      headers,
+    };
+  }
   if (parts[0] === 'repos' && parts.length >= 3) return repoRoutes(req, parts[1], parts[2]);
   return notFound();
 }
@@ -167,6 +194,13 @@ function userRoutes(req: RestRequest): RestResult {
         req.body?.private === true,
         bodyString(req.body, 'default_branch') || 'main',
       );
+      forge.recordEvent('CreateEvent', repo, {
+        ref: null,
+        ref_type: 'repository',
+        master_branch: repo.defaultBranch,
+        description: repo.description,
+        pusher_type: 'user',
+      });
       return { status: 201, body: repoJson(repo) };
     }
     if (req.method === 'GET') {
@@ -214,8 +248,12 @@ function repoRoutes(req: RestRequest, owner: string, name: string): RestResult {
       return branchRoutes(req, repo, rest.slice(1));
     case 'commits':
       return commitRoutes(req, repo, rest.slice(1));
+    case 'compare':
+      return compareRoutes(req, repo, rest.slice(1).join('/'));
     case 'contents':
       return contentRoutes(req, repo, rest.slice(1).join('/'));
+    case 'events':
+      return repoEventRoutes(req, repo, rest.slice(1));
     case 'git':
       return gitRoutes(req, repo, rest.slice(1));
     case 'labels':
@@ -224,6 +262,17 @@ function repoRoutes(req: RestRequest, owner: string, name: string): RestResult {
       return issueRoutes(req, repo, rest.slice(1));
     case 'pulls':
       return pullRoutes(req, repo, rest.slice(1));
+    case 'releases':
+      return releaseRoutes(req, repo, rest.slice(1));
+    case 'tags':
+      if (rest.length === 1 && req.method === 'GET') {
+        const tags = [...repo.refs.entries()]
+          .filter(([ref]) => ref.startsWith('refs/tags/'))
+          .sort(([a], [b]) => (a < b ? -1 : 1))
+          .map(([ref, sha]) => tagRefJson(repo, ref.slice('refs/tags/'.length), peelToCommit(repo.objects, sha) ?? sha));
+        return { status: 200, body: tags };
+      }
+      return notFound();
     default:
       return notFound();
   }
@@ -330,7 +379,7 @@ function contentRoutes(req: RestRequest, repo: Repo, path: string): RestResult {
     }
     const blob = repo.objects.put('blob', Buffer.from(content.replace(/\s+/g, ''), 'base64'));
     files.set(path, blob);
-    const commitSha = commitFiles(repo, ref, files, message);
+    const commitSha = commitFiles(forge, repo, ref, files, message);
     const status = existing ? 200 : 201;
     const commit = commitJson(repo, commitSha);
     return {
@@ -365,7 +414,7 @@ function contentRoutes(req: RestRequest, repo: Repo, path: string): RestResult {
     if (!existing) return notFound();
     if (sha !== existing) return { status: 409, body: { message: 'Conflict: the given sha does not match the current file sha' } };
     files.delete(path);
-    const commitSha = commitFiles(repo, ref, files, message);
+    const commitSha = commitFiles(forge, repo, ref, files, message);
     const commit = commitJson(repo, commitSha);
     return {
       status: 200,
@@ -430,48 +479,389 @@ function dirTreeSha(repo: Repo, dir: string): string | null {
 }
 
 function gitRoutes(req: RestRequest, repo: Repo, rest: string[]): RestResult {
-  if (rest[0] === 'refs') {
-    if (req.method === 'POST' && rest.length === 1) {
-      const ref = bodyString(req.body, 'ref');
-      const sha = bodyString(req.body, 'sha');
-      if (!ref || !sha || !ref.startsWith('refs/')) return unprocessable('Validation Failed');
-      const object = repo.objects.get(sha);
-      if (!object) return unprocessable('Object does not exist', [{ resource: 'Reference', code: 'custom', field: 'sha', message: 'Object does not exist' }]);
-      repo.refs.set(ref, sha);
-      return {
-        status: 201,
-        body: {
-          ref,
-          node_id: `REF:${ref}`,
-          url: `${req.base}/api/v3/repos/${repo.fullName}/git/refs/${ref.slice('refs/'.length)}`,
-          object: { type: object.type, sha, url: `${req.base}/api/v3/repos/${repo.fullName}/git/${object.type === 'commit' ? 'commits' : 'trees'}/${sha}` },
-        },
-      };
+  switch (rest[0]) {
+    case 'refs':
+      return gitRefRoutes(req, repo, rest.slice(1));
+    case 'trees':
+      return gitTreeRoutes(req, repo, rest[1]);
+    case 'blobs':
+      return gitBlobRoutes(req, repo, rest[1]);
+    case 'commits':
+      return gitCommitRoutes(req, repo, rest[1]);
+    case 'tags':
+      return gitTagRoutes(req, repo, rest[1]);
+    default:
+      return notFound();
+  }
+}
+
+function refJson(req: RestRequest, repo: Repo, ref: string, sha: string): Json {
+  const object = repo.objects.get(sha);
+  return {
+    ref,
+    node_id: `REF:${ref}`,
+    url: `${req.base}/api/v3/repos/${repo.fullName}/git/refs/${ref.slice('refs/'.length)}`,
+    object: {
+      type: object?.type ?? 'commit',
+      sha,
+      url: `${req.base}/api/v3/repos/${repo.fullName}/git/${object?.type === 'tree' ? 'trees' : object?.type === 'tag' ? 'tags' : 'commits'}/${sha}`,
+    },
+  } as unknown as Json;
+}
+
+function gitRefRoutes(req: RestRequest, repo: Repo, rest: string[]): RestResult {
+  if (req.method === 'POST' && rest.length === 0) {
+    const ref = bodyString(req.body, 'ref');
+    const sha = bodyString(req.body, 'sha');
+    if (!ref || !sha || !ref.startsWith('refs/')) return unprocessable('Validation Failed');
+    const object = repo.objects.get(sha);
+    if (!object) return unprocessable('Object does not exist', [{ resource: 'Reference', code: 'custom', field: 'sha', message: 'Object does not exist' }]);
+    if (repo.refs.has(ref)) return unprocessable('Reference already exists');
+    repo.refs.set(ref, sha);
+    recordRefUpdate(forge, repo, ref, ZERO_OID, sha);
+    return { status: 201, body: refJson(req, repo, ref, sha) };
+  }
+  const name = rest.join('/');
+  const full = name.startsWith('refs/') ? name : `refs/${name}`;
+  if (req.method === 'GET') {
+    if (name) {
+      const sha = repo.refs.get(full);
+      if (!sha) return notFound();
+      return { status: 200, body: refJson(req, repo, full, sha) };
     }
-    if (req.method === 'GET') {
-      const name = rest.slice(1).join('/');
-      if (name) {
-        const full = name.startsWith('refs/') ? name : `refs/${name}`;
-        const sha = repo.refs.get(full);
-        if (!sha) return notFound();
-        const object = repo.objects.get(sha);
-        return {
-          status: 200,
-          body: {
-            ref: full,
-            node_id: `REF:${full}`,
-            url: `${req.base}/api/v3/repos/${repo.fullName}/git/refs/${name}`,
-            object: { type: object?.type ?? 'commit', sha, url: `${req.base}/api/v3/repos/${repo.fullName}/git/commits/${sha}` },
-          },
-        };
+    const all = [...repo.refs.entries()].sort(([a], [b]) => (a < b ? -1 : 1)).map(([ref, sha]) => refJson(req, repo, ref, sha));
+    return { status: 200, body: all };
+  }
+  if (req.method === 'PATCH' && name) {
+    const current = repo.refs.get(full);
+    if (!current) return notFound();
+    const sha = bodyString(req.body, 'sha');
+    if (!sha || !repo.objects.has(sha)) {
+      return unprocessable('Object does not exist', [{ resource: 'Reference', code: 'custom', field: 'sha', message: 'Object does not exist' }]);
+    }
+    repo.refs.set(full, sha);
+    recordRefUpdate(forge, repo, full, current, sha);
+    return { status: 200, body: refJson(req, repo, full, sha) };
+  }
+  if (req.method === 'DELETE' && name) {
+    const current = repo.refs.get(full);
+    if (!current) return notFound();
+    repo.refs.delete(full);
+    recordRefUpdate(forge, repo, full, current, ZERO_OID);
+    return { status: 204 };
+  }
+  return notFound();
+}
+
+function gitTreeRoutes(req: RestRequest, repo: Repo, sha: string | undefined): RestResult {
+  if (req.method === 'POST' && sha === undefined) {
+    // Create a tree from path entries, optionally overlaid on a base tree. An entry with
+    // `content` stores a new blob; `sha: null` deletes the path. The forge's file model is
+    // the flat path -> blob map every other surface uses, so entries name full paths.
+    const baseTree = bodyString(req.body, 'base_tree');
+    let files = new Map<string, string>();
+    if (baseTree) {
+      const baseObject = repo.objects.get(baseTree);
+      if (!baseObject || baseObject.type !== 'tree') return unprocessable('Validation Failed', [{ resource: 'Tree', code: 'invalid', field: 'base_tree' }]);
+      files = flattenTree(repo.objects, baseTree);
+    }
+    const entries = Array.isArray(req.body?.tree) ? (req.body.tree as Array<Record<string, unknown>>) : null;
+    if (!entries) return unprocessable('Validation Failed', [{ resource: 'Tree', code: 'missing_field', field: 'tree' }]);
+    for (const entry of entries) {
+      const path = typeof entry.path === 'string' ? entry.path : null;
+      if (!path || entry.type !== 'blob') continue;
+      if (entry.sha === null) {
+        files.delete(path);
+        continue;
       }
-      const all = [...repo.refs.entries()].sort(([a], [b]) => (a < b ? -1 : 1)).map(([ref, sha]) => ({
-        ref,
-        node_id: `REF:${ref}`,
-        url: `${req.base}/api/v3/repos/${repo.fullName}/git/refs/${ref.slice('refs/'.length)}`,
-        object: { type: repo.objects.get(sha)?.type ?? 'commit', sha, url: `${req.base}/api/v3/repos/${repo.fullName}/git/commits/${sha}` },
-      }));
-      return { status: 200, body: all };
+      if (typeof entry.content === 'string') {
+        files.set(path, repo.objects.put('blob', Buffer.from(entry.content, 'utf8')));
+      } else if (typeof entry.sha === 'string') {
+        const target = repo.objects.get(entry.sha);
+        if (!target || target.type !== 'blob') return unprocessable('Validation Failed', [{ resource: 'Tree', code: 'invalid', field: 'sha', value: entry.sha }]);
+        files.set(path, entry.sha);
+      }
+    }
+    const tree = buildTreeFromFiles(repo.objects, files);
+    return { status: 201, body: { sha: tree, url: `${req.base}/api/v3/repos/${repo.fullName}/git/trees/${tree}` } };
+  }
+  if (req.method !== 'GET' || !sha) return notFound();
+  const object = repo.objects.get(sha);
+  if (!object || object.type !== 'tree') return notFound();
+  const recursive = req.query.get('recursive') === '1' || req.query.get('recursive') === 'true';
+  const entries: Json[] = [];
+  const walk = (treeOid: string, prefix: string): void => {
+    const treeObject = repo.objects.get(treeOid);
+    if (!treeObject || treeObject.type !== 'tree') return;
+    for (const entry of parseTree(treeObject.data)) {
+      const isTree = entry.mode === '40000';
+      const item: Json = {
+        path: prefix + entry.name,
+        mode: entry.mode,
+        type: isTree ? 'tree' : 'blob',
+        sha: entry.oid,
+        url: `${req.base}/api/v3/repos/${repo.fullName}/git/${isTree ? 'trees' : 'blobs'}/${entry.oid}`,
+      };
+      if (!isTree) item.size = repo.objects.get(entry.oid)?.data.length ?? 0;
+      entries.push(item);
+      if (isTree && recursive) walk(entry.oid, `${prefix}${entry.name}/`);
+    }
+  };
+  walk(sha, '');
+  return {
+    status: 200,
+    body: { sha, url: `${req.base}/api/v3/repos/${repo.fullName}/git/trees/${sha}`, tree: entries, truncated: false },
+  };
+}
+
+function gitBlobRoutes(req: RestRequest, repo: Repo, sha: string | undefined): RestResult {
+  if (req.method === 'POST' && sha === undefined) {
+    const content = bodyString(req.body, 'content');
+    if (content === undefined) return unprocessable('Validation Failed', [{ resource: 'Blob', code: 'missing_field', field: 'content' }]);
+    const encoding = bodyString(req.body, 'encoding') ?? 'utf-8';
+    const data = encoding === 'base64' ? Buffer.from(content.replace(/\s+/g, ''), 'base64') : Buffer.from(content, 'utf8');
+    const created = repo.objects.put('blob', data);
+    return { status: 201, body: { sha: created, url: `${req.base}/api/v3/repos/${repo.fullName}/git/blobs/${created}` } };
+  }
+  if (req.method !== 'GET' || !sha) return notFound();
+  const object = repo.objects.get(sha);
+  if (!object || object.type !== 'blob') return notFound();
+  return {
+    status: 200,
+    body: {
+      content: object.data.toString('base64'),
+      encoding: 'base64',
+      size: object.data.length,
+      sha,
+      url: `${req.base}/api/v3/repos/${repo.fullName}/git/blobs/${sha}`,
+      node_id: `BLOB:${sha}`,
+    },
+  };
+}
+
+/** An ident object ({name, email, date}) from a request body, as a git ident line. */
+function identLineFrom(body: Record<string, unknown> | undefined, key: string): string {
+  const raw = body?.[key] as { name?: unknown; email?: unknown; date?: unknown } | undefined;
+  if (!raw || typeof raw.name !== 'string' || typeof raw.email !== 'string') return viewerIdentLine();
+  const epoch = typeof raw.date === 'string' ? Math.floor(Date.parse(raw.date) / 1000) : NaN;
+  return formatIdent(raw.name, raw.email, Number.isFinite(epoch) ? epoch : Math.floor(Date.now() / 1000));
+}
+
+function gitCommitRoutes(req: RestRequest, repo: Repo, sha: string | undefined): RestResult {
+  if (req.method === 'POST' && sha === undefined) {
+    const message = bodyString(req.body, 'message');
+    const tree = bodyString(req.body, 'tree');
+    if (message === undefined || !tree) return unprocessable('Validation Failed');
+    const treeObject = repo.objects.get(tree);
+    if (!treeObject || treeObject.type !== 'tree') {
+      return unprocessable('Validation Failed', [{ resource: 'GitCommit', code: 'invalid', field: 'tree', message: 'tree does not exist' }]);
+    }
+    const parentsRaw = Array.isArray(req.body?.parents) ? (req.body.parents as unknown[]) : [];
+    const parents: string[] = [];
+    for (const parent of parentsRaw) {
+      if (typeof parent !== 'string' || !repo.objects.has(parent)) {
+        return unprocessable('Validation Failed', [{ resource: 'GitCommit', code: 'invalid', field: 'parents', message: 'a parent does not exist' }]);
+      }
+      parents.push(parent);
+    }
+    const data = Buffer.from(
+      `${[`tree ${tree}`, ...parents.map((parent) => `parent ${parent}`), `author ${identLineFrom(req.body, 'author')}`, `committer ${identLineFrom(req.body, 'committer')}`].join('\n')}\n\n${message}`,
+      'utf8',
+    );
+    const created = repo.objects.put('commit', data);
+    return { status: 201, body: gitCommitJson(repo, created) };
+  }
+  if (req.method !== 'GET' || !sha) return notFound();
+  const commit = gitCommitJson(repo, sha);
+  return commit ? { status: 200, body: commit } : notFound();
+}
+
+function gitTagRoutes(req: RestRequest, repo: Repo, sha: string | undefined): RestResult {
+  const api = `${req.base}/api/v3/repos/${repo.fullName}`;
+  if (req.method === 'POST' && sha === undefined) {
+    const tag = bodyString(req.body, 'tag');
+    const message = bodyString(req.body, 'message');
+    const objectSha = bodyString(req.body, 'object');
+    const type = bodyString(req.body, 'type') ?? 'commit';
+    if (!tag || message === undefined || !objectSha) return unprocessable('Validation Failed');
+    const target = repo.objects.get(objectSha);
+    if (!target) return unprocessable('Object does not exist', [{ resource: 'Tag', code: 'custom', field: 'object', message: 'Object does not exist' }]);
+    const tagger = identLineFrom(req.body, 'tagger');
+    const data = Buffer.from(`object ${objectSha}\ntype ${type}\ntag ${tag}\ntagger ${tagger}\n\n${message}`, 'utf8');
+    const created = repo.objects.put('tag', data);
+    const ref = `refs/tags/${tag}`;
+    const before = repo.refs.get(ref) ?? ZERO_OID;
+    repo.refs.set(ref, created);
+    recordRefUpdate(forge, repo, ref, before, created);
+    return {
+      status: 201,
+      body: {
+        node_id: `TAG:${created}`,
+        tag,
+        sha: created,
+        url: `${api}/git/tags/${created}`,
+        message,
+        tagger: { name: tagger.replace(/ <.*$/, ''), email: /<([^>]*)>/.exec(tagger)?.[1] ?? '', date: '' },
+        object: { sha: objectSha, type: target.type, url: `${api}/git/${target.type === 'commit' ? 'commits' : 'trees'}/${objectSha}` },
+      },
+    };
+  }
+  if (req.method !== 'GET' || !sha) return notFound();
+  const object = repo.objects.get(sha);
+  if (!object || object.type !== 'tag') return notFound();
+  const text = object.data.toString('utf8');
+  const field = (name: string): string => new RegExp(`^${name} (.*)$`, 'm').exec(text)?.[1] ?? '';
+  const taggerLine = field('tagger');
+  const taggerMatch = /^(.*?) <(.*?)> (\d+) [+-]\d{4}$/.exec(taggerLine);
+  const targetSha = field('object');
+  const targetType = field('type') || 'commit';
+  return {
+    status: 200,
+    body: {
+      node_id: `TAG:${sha}`,
+      tag: field('tag'),
+      sha,
+      url: `${api}/git/tags/${sha}`,
+      message: text.includes('\n\n') ? text.slice(text.indexOf('\n\n') + 2) : '',
+      tagger: taggerMatch
+        ? { name: taggerMatch[1], email: taggerMatch[2], date: new Date(Number(taggerMatch[3]) * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z') }
+        : { name: '', email: '', date: '' },
+      object: { sha: targetSha, type: targetType, url: `${api}/git/${targetType === 'commit' ? 'commits' : targetType === 'tree' ? 'trees' : 'tags'}/${targetSha}` },
+    },
+  };
+}
+
+/** GET /repos/{owner}/{repo}/events — the repository's activity feed, newest first. */
+function repoEventRoutes(req: RestRequest, repo: Repo, rest: string[]): RestResult {
+  if (rest.length !== 0 || req.method !== 'GET') return notFound();
+  const mine = forge.events.filter((event) => event.repoFullName === repo.fullName).reverse();
+  const { page, headers } = paginate(req, mine, `/api/v3/repos/${repo.fullName}/events`);
+  return { status: 200, body: page.map((event) => eventJson(repo, event)), headers };
+}
+
+/** GET /repos/{owner}/{repo}/compare/{base}...{head} — divergence and the diff between two commits. */
+function compareRoutes(req: RestRequest, repo: Repo, spec: string): RestResult {
+  if (req.method !== 'GET') return notFound();
+  const splitAt = spec.includes('...') ? spec.indexOf('...') : spec.indexOf('..');
+  if (splitAt < 0) return notFound();
+  const dots = spec.startsWith('...', splitAt) ? 3 : 2;
+  const baseName = decodeURIComponent(spec.slice(0, splitAt));
+  const headName = decodeURIComponent(spec.slice(splitAt + dots));
+  const baseRaw = resolveCommit(repo, baseName);
+  const headRaw = resolveCommit(repo, headName);
+  if (!baseRaw || !headRaw) return notFound();
+  const base = peelToCommit(repo.objects, baseRaw) ?? baseRaw;
+  const head = peelToCommit(repo.objects, headRaw) ?? headRaw;
+  const baseCommits = repo.listCommits(base, 10_000);
+  const headCommits = repo.listCommits(head, 10_000);
+  const baseSet = new Set(baseCommits);
+  const headSet = new Set(headCommits);
+  const ahead = headCommits.filter((sha) => !baseSet.has(sha));
+  const behind = baseCommits.filter((sha) => !headSet.has(sha));
+  const status = base === head ? 'identical' : ahead.length > 0 && behind.length > 0 ? 'diverged' : ahead.length > 0 ? 'ahead' : 'behind';
+  const baseForDiff = mergeBase(repo.objects, base, head) ?? base;
+  const files = diffTrees(repo.objects, treeOf(repo, baseForDiff), treeOf(repo, head));
+  const api = `${req.base}/api/v3/repos/${repo.fullName}`;
+  return {
+    status: 200,
+    body: {
+      url: `${api}/compare/${baseName}...${headName}`,
+      html_url: `${req.base}/${repo.fullName}/compare/${baseName}...${headName}`,
+      permalink_url: `${api}/compare/${base.slice(0, 7)}...${head.slice(0, 7)}`,
+      diff_url: `${req.base}/${repo.fullName}/compare/${baseName}...${headName}.diff`,
+      patch_url: `${req.base}/${repo.fullName}/compare/${baseName}...${headName}.patch`,
+      base_commit: commitJson(repo, base),
+      merge_base_commit: commitJson(repo, baseForDiff),
+      status,
+      ahead_by: ahead.length,
+      behind_by: behind.length,
+      total_commits: ahead.length,
+      commits: ahead.slice(0, 250).map((sha) => commitJson(repo, sha)).filter(Boolean),
+      files: files.map((file) => ({
+        sha: file.sha,
+        filename: file.path,
+        status: file.status,
+        additions: file.additions,
+        deletions: file.deletions,
+        changes: file.changes,
+        blob_url: file.sha ? `${api}/git/blobs/${file.sha}` : null,
+        raw_url: file.sha ? `${req.base}/${repo.fullName}/raw/${headName}/${file.path}` : null,
+        contents_url: `${api}/contents/${file.path}?ref=${headName}`,
+      })),
+    },
+  };
+}
+
+function releaseRoutes(req: RestRequest, repo: Repo, rest: string[]): RestResult {
+  if (rest[0] === 'tags' && rest.length === 2) {
+    if (req.method !== 'GET') return notFound();
+    const tag = decodeURIComponent(rest[1]);
+    const release = [...repo.releases.values()].find((item) => item.tagName === tag);
+    return release ? { status: 200, body: releaseJson(repo, release) } : notFound();
+  }
+  if (rest.length === 0) {
+    if (req.method === 'GET') {
+      const all = [...repo.releases.values()].sort((a, b) => b.id - a.id);
+      const { page, headers } = paginate(req, all, `/api/v3/repos/${repo.fullName}/releases`);
+      return { status: 200, body: page.map((release) => releaseJson(repo, release)), headers };
+    }
+    if (req.method === 'POST') {
+      const tagName = bodyString(req.body, 'tag_name');
+      if (!tagName) {
+        return unprocessable('Validation Failed', [{ resource: 'Release', code: 'missing_field', field: 'tag_name' }]);
+      }
+      if ([...repo.releases.values()].some((item) => item.tagName === tagName)) {
+        return unprocessable('Validation Failed', [{ resource: 'Release', code: 'already_exists', field: 'tag_name' }]);
+      }
+      const targetCommitish = bodyString(req.body, 'target_commitish') ?? repo.defaultBranch;
+      const ref = `refs/tags/${tagName}`;
+      if (!repo.refs.has(ref)) {
+        // GitHub creates the tag at the target when the release names a new one.
+        const target = resolveCommit(repo, targetCommitish);
+        const commit = target ? peelToCommit(repo.objects, target) : null;
+        if (!commit) return unprocessable('Validation Failed', [{ resource: 'Release', code: 'invalid', field: 'target_commitish' }]);
+        repo.refs.set(ref, commit);
+        recordRefUpdate(forge, repo, ref, ZERO_OID, commit);
+      }
+      const draft = req.body?.draft === true;
+      const now = nowDate();
+      const release = {
+        id: forge.newReleaseId(),
+        tagName,
+        targetCommitish,
+        name: bodyString(req.body, 'name') ?? null,
+        body: bodyString(req.body, 'body') ?? null,
+        draft,
+        prerelease: req.body?.prerelease === true,
+        createdAt: now,
+        publishedAt: draft ? null : now,
+      };
+      repo.releases.set(release.id, release);
+      return { status: 201, body: releaseJson(repo, release) };
+    }
+    return notFound();
+  }
+  if (rest.length === 1) {
+    const release = repo.releases.get(Number(rest[0]));
+    if (!release) return notFound();
+    if (req.method === 'GET') return { status: 200, body: releaseJson(repo, release) };
+    if (req.method === 'PATCH') {
+      const tagName = bodyString(req.body, 'tag_name');
+      if (tagName !== undefined) release.tagName = tagName;
+      const target = bodyString(req.body, 'target_commitish');
+      if (target !== undefined) release.targetCommitish = target;
+      if (req.body && 'name' in req.body) release.name = bodyString(req.body, 'name') ?? null;
+      if (req.body && 'body' in req.body) release.body = bodyString(req.body, 'body') ?? null;
+      if (typeof req.body?.draft === 'boolean') {
+        release.draft = req.body.draft;
+        if (!release.draft && release.publishedAt === null) release.publishedAt = nowDate();
+      }
+      if (typeof req.body?.prerelease === 'boolean') release.prerelease = req.body.prerelease;
+      return { status: 200, body: releaseJson(repo, release) };
+    }
+    if (req.method === 'DELETE') {
+      repo.releases.delete(release.id);
+      return { status: 204 };
     }
   }
   return notFound();
@@ -539,12 +929,34 @@ function issueRoutes(req: RestRequest, repo: Repo, rest: string[]): RestResult {
   const issue = Number.isInteger(number) ? repo.issues.get(number) : undefined;
   if (!issue) return notFound();
   if (rest.length === 1) {
-    if (req.method === 'GET') return { status: 200, body: issueJson(repo, issue) };
+    if (req.method === 'GET') {
+      // The read workload hammers this one route; the body is a pure function of the fields
+      // fingerprinted here (plus the base and the repo's identity), so serve the memo.
+      const key = [
+        req.base,
+        repo.fullName,
+        issue.updatedAt.getTime(),
+        issue.closedAt?.getTime() ?? 0,
+        issue.state,
+        issue.title,
+        issue.body ?? '',
+        issue.labels.join('\u0001'),
+        issue.comments.length,
+        issue.pull?.merged ? 1 : 0,
+        issue.pull?.mergedAt?.getTime() ?? 0,
+      ].join('|');
+      if (issue.getMemo?.key === key) return { status: 200, raw: issue.getMemo.body };
+      const raw = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+      issue.getMemo = { key, body: raw };
+      return { status: 200, raw };
+    }
     if (req.method === 'PATCH') {
       const labels = req.body && 'labels' in req.body ? labelNames(req.body) : undefined;
       if (labels) {
         const bad = checkLabels(repo, labels);
         if (bad) return bad;
+        for (const name of labels) if (!issue.labels.includes(name)) recordIssueEvent(forge, repo, 'labeled', issue, name);
+        for (const name of issue.labels) if (!labels.includes(name)) recordIssueEvent(forge, repo, 'unlabeled', issue, name);
         issue.labels = labels;
       }
       const title = bodyString(req.body, 'title');
@@ -552,13 +964,26 @@ function issueRoutes(req: RestRequest, repo: Repo, rest: string[]): RestResult {
       if (req.body && 'body' in req.body) issue.body = bodyString(req.body, 'body') ?? null;
       const state = bodyString(req.body, 'state');
       if (state === 'closed' || state === 'open') {
+        const changed = state !== issue.state;
         issue.state = state;
         issue.closedAt = state === 'closed' ? nowDate() : null;
+        if (changed) recordIssueEvent(forge, repo, state === 'closed' ? 'closed' : 'reopened', issue);
       }
       issue.updatedAt = nowDate();
       return { status: 200, body: issueJson(repo, issue) };
     }
     return notFound();
+  }
+  if (rest[1] === 'events' && rest.length === 2 && req.method === 'GET') {
+    const mine = forge.events
+      .filter((event) => event.repoFullName === repo.fullName && Number(event.payload.issueNumber ?? -1) === number)
+      .reverse();
+    const { page, headers } = paginate(req, mine, `/api/v3/repos/${repo.fullName}/issues/${number}/events`);
+    return {
+      status: 200,
+      body: page.map((event) => issueEventJson(repo, event)).filter(Boolean),
+      headers,
+    };
   }
   if (rest[1] === 'comments') {
     if (rest.length === 2 && req.method === 'GET') {
@@ -567,7 +992,7 @@ function issueRoutes(req: RestRequest, repo: Repo, rest: string[]): RestResult {
     if (rest.length === 2 && req.method === 'POST') {
       const body = bodyString(req.body, 'body');
       if (body === undefined) return unprocessable('Validation Failed', [{ resource: 'IssueComment', code: 'missing_field', field: 'body' }]);
-      const comment = addCommentRecord(forge, issue, body);
+      const comment = addCommentRecord(forge, repo, issue, body);
       return { status: 201, body: commentJson(repo, issue, comment) };
     }
     if (rest.length === 3 && req.method === 'GET') {
@@ -583,7 +1008,12 @@ function issueRoutes(req: RestRequest, repo: Repo, rest: string[]): RestResult {
       const labels = labelNames(req.body);
       const bad = checkLabels(repo, labels);
       if (bad) return bad;
-      for (const name of labels) if (!issue.labels.includes(name)) issue.labels.push(name);
+      for (const name of labels) {
+        if (!issue.labels.includes(name)) {
+          issue.labels.push(name);
+          recordIssueEvent(forge, repo, 'labeled', issue, name);
+        }
+      }
       issue.updatedAt = nowDate();
       return { status: 200, body: issue.labels.map((name) => repo.labels.get(name)).filter(Boolean).map((label) => labelJson(repo, label as NonNullable<typeof label>)) };
     }
@@ -667,8 +1097,10 @@ function pullRoutes(req: RestRequest, repo: Repo, rest: string[]): RestResult {
       if (req.body && 'body' in req.body) pr.body = bodyString(req.body, 'body') ?? null;
       const state = bodyString(req.body, 'state');
       if (state === 'closed' || state === 'open') {
+        const changed = state !== pr.state;
         pr.state = state;
         pr.closedAt = state === 'closed' ? nowDate() : null;
+        if (changed) recordIssueEvent(forge, repo, state === 'closed' ? 'closed' : 'reopened', pr);
       }
       pr.updatedAt = nowDate();
       return { status: 200, body: pullJson(req, repo, pr) };
@@ -703,7 +1135,7 @@ function pullRoutes(req: RestRequest, repo: Repo, rest: string[]): RestResult {
     if (expectedSha && headTip && expectedSha !== headTip) {
       return { status: 409, body: { message: 'Head branch was modified. Review and try the merge again.' } };
     }
-    const outcome = mergePull(repo, pr);
+    const outcome = mergePull(forge, repo, pr);
     if (!outcome.ok) {
       if (outcome.reason === 'already-merged') return { status: 405, body: { message: 'Pull Request is not mergeable' } };
       if (outcome.reason === 'missing-ref') return notFound();

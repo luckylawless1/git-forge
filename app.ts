@@ -122,6 +122,7 @@ async function dispatch(req: IncomingMessage, body: Buffer): Promise<Reply> {
     const headers: Record<string, string> = { 'X-OAuth-Scopes': '', 'X-Accepted-OAuth-Scopes': '' };
     if (result.headers) Object.assign(headers, result.headers);
     if (result.status === 204) return { status: 204, contentType: 'application/json; charset=utf-8', body: Buffer.alloc(0), headers };
+    if (result.raw) return { status: result.status, contentType: 'application/json; charset=utf-8', body: result.raw, headers };
     return jsonReply(result.status, result.body ?? {}, headers);
   }
 

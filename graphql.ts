@@ -836,7 +836,7 @@ def('Mutation', {
     if (!value || value.__typename !== 'PullRequest') throw new Error('the pullRequestId does not name a pull request');
     const repo = value.repo as Repo;
     const rec = value.rec as IssueRec;
-    const outcome = mergePull(repo, rec);
+    const outcome = mergePull(forge, repo, rec);
     if (!outcome.ok && outcome.reason === 'conflict') throw new Error('the pull request is not mergeable: its branch conflicts with the base');
     return { __typename: 'MergePullRequestPayload', clientMutationId: (input.clientMutationId as string) ?? null, pullRequest: prValue(repo, rec) };
   },
@@ -846,7 +846,7 @@ def('Mutation', {
     if (!value || (value.__typename !== 'Issue' && value.__typename !== 'PullRequest')) throw new Error('the subjectId does not name an issue or pull request');
     const repo = value.repo as Repo;
     const rec = value.rec as IssueRec;
-    const comment = addCommentRecord(forge, rec, String(input.body ?? ''));
+    const comment = addCommentRecord(forge, repo, rec, String(input.body ?? ''));
     return {
       __typename: 'AddCommentPayload',
       clientMutationId: (input.clientMutationId as string) ?? null,

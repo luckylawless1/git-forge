@@ -76,6 +76,36 @@ export interface IssueRec {
     mergedAt: Date | null;
     mergeCommitSha: string | null;
   } | null;
+  /** Memoised single-issue GET body; the key fingerprints every field the body renders. */
+  getMemo?: { key: string; body: Buffer };
+}
+
+/** A release: a named snapshot of a tag, in GitHub's shape. */
+export interface ReleaseRec {
+  id: number;
+  tagName: string;
+  targetCommitish: string;
+  name: string | null;
+  body: string | null;
+  draft: boolean;
+  prerelease: boolean;
+  createdAt: Date;
+  publishedAt: Date | null;
+}
+
+/**
+ * One entry of the forge's activity log (the Events API). Payloads keep raw references —
+ * issue and comment numbers, ref names, object ids — and the serializers expand them into
+ * GitHub's event shapes at read time, so an event always names objects as they now stand.
+ */
+export interface EventRec {
+  id: number;
+  type: string;
+  actorLogin: string;
+  repoFullName: string;
+  repoId: number;
+  payload: Record<string, unknown>;
+  createdAt: Date;
 }
 
 export class Repo {
@@ -83,6 +113,7 @@ export class Repo {
   readonly refs = new Map<string, string>();
   readonly labels = new Map<string, LabelRec>();
   readonly issues = new Map<number, IssueRec>();
+  readonly releases = new Map<number, ReleaseRec>();
   nextNumber = 1;
   headRef: string;
   readonly id: number;
@@ -152,10 +183,14 @@ export class Repo {
 export class Forge {
   readonly repos = new Map<string, Repo>();
   readonly reposById = new Map<number, Repo>();
+  /** The activity log behind the Events API, oldest first; reads serve it newest first. */
+  readonly events: EventRec[] = [];
   private nextRepoId = 1;
   private nextIssueId = 1;
   private nextCommentId = 1;
   private nextLabelId = 1;
+  private nextReleaseId = 1;
+  private nextEventId = 1;
 
   createRepo(name: string, description: string, isPrivate: boolean, defaultBranch = 'main'): Repo {
     const repo = new Repo(this.nextRepoId++, VIEWER_LOGIN, name, description, isPrivate, defaultBranch, nowDate(), nowDate());
@@ -188,6 +223,26 @@ export class Forge {
 
   newLabelId(): number {
     return this.nextLabelId++;
+  }
+
+  newReleaseId(): number {
+    return this.nextReleaseId++;
+  }
+
+  /** Append one activity event; the log is capped so a long trial cannot grow it without bound. */
+  recordEvent(type: string, repo: Repo, payload: Record<string, unknown>): EventRec {
+    const event: EventRec = {
+      id: this.nextEventId++,
+      type,
+      actorLogin: VIEWER_LOGIN,
+      repoFullName: repo.fullName,
+      repoId: repo.id,
+      payload,
+      createdAt: nowDate(),
+    };
+    this.events.push(event);
+    if (this.events.length > 10_000) this.events.splice(0, this.events.length - 10_000);
+    return event;
   }
 }
 

@@ -9,8 +9,10 @@ import {
   isoOf,
   nodeId,
   type CommentRec,
+  type EventRec,
   type IssueRec,
   type LabelRec,
+  type ReleaseRec,
   type Repo,
 } from './store.ts';
 
@@ -174,6 +176,181 @@ export function issueJson(repo: Repo, issue: IssueRec): Json {
       patch_url: u(`/${repo.fullName}/pull/${issue.number}.patch`),
       merged_at: issue.pull.mergedAt ? isoOf(issue.pull.mergedAt) : null,
     };
+  }
+  return out;
+}
+
+export function releaseJson(repo: Repo, release: ReleaseRec): Json {
+  const api = u(`/api/v3/repos/${repo.fullName}/releases/${release.id}`);
+  return {
+    url: api,
+    assets_url: `${api}/assets`,
+    upload_url: `${api}/assets{?name,label}`,
+    html_url: u(`/${repo.fullName}/releases/tag/${encodeURIComponent(release.tagName)}`),
+    id: release.id,
+    node_id: nodeId('Release', release.id),
+    tag_name: release.tagName,
+    target_commitish: release.targetCommitish,
+    name: release.name,
+    draft: release.draft,
+    author: userJson(repo.owner),
+    prerelease: release.prerelease,
+    created_at: isoOf(release.createdAt),
+    published_at: release.publishedAt ? isoOf(release.publishedAt) : null,
+    assets: [],
+    tarball_url: u(`/api/v3/repos/${repo.fullName}/tarball/${encodeURIComponent(release.tagName)}`),
+    zipball_url: u(`/api/v3/repos/${repo.fullName}/zipball/${encodeURIComponent(release.tagName)}`),
+    body: release.body,
+  };
+}
+
+/** One entry of GET /tags: a tag ref with the commit it names. */
+export function tagRefJson(repo: Repo, name: string, sha: string): Json {
+  const api = u(`/api/v3/repos/${repo.fullName}`);
+  return {
+    name,
+    node_id: nodeId('Tag', `${repo.id}:${name}`),
+    commit: { sha, url: `${api}/commits/${sha}` },
+    zipball_url: `${api}/zipball/refs/tags/${encodeURIComponent(name)}`,
+    tarball_url: `${api}/tarball/refs/tags/${encodeURIComponent(name)}`,
+  };
+}
+
+/** The git-database commit shape (GET /git/commits/{sha}), distinct from the REST commit. */
+export function gitCommitJson(repo: Repo, sha: string): Json | null {
+  const object = repo.objects.get(sha);
+  if (!object || object.type !== 'commit') return null;
+  const commit = parseCommit(object.data);
+  const api = u(`/api/v3/repos/${repo.fullName}`);
+  const ident = (name: string, email: string, epoch: number): Json => ({
+    name,
+    email,
+    date: isoOf(new Date(epoch * 1000)),
+  });
+  return {
+    sha,
+    node_id: nodeId('GitCommit', sha),
+    url: `${api}/git/commits/${sha}`,
+    author: ident(commit.authorName, commit.authorEmail, commit.authorEpoch),
+    committer: ident(commit.committerName, commit.committerEmail, commit.committerEpoch),
+    message: commit.message,
+    tree: { sha: commit.tree, url: `${api}/git/trees/${commit.tree}` },
+    parents: commit.parents.map((parent) => ({ sha: parent, url: `${api}/git/commits/${parent}` })),
+    verification: { verified: false, reason: 'unsigned', signature: null, payload: null },
+  };
+}
+
+/** Expand one stored commit reference of a PushEvent payload into GitHub's commit shape. */
+function pushCommitJson(repo: Repo, stored: Record<string, unknown>): Json {
+  const sha = String(stored.sha ?? '');
+  return {
+    id: sha,
+    sha,
+    message: String(stored.message ?? ''),
+    timestamp: null,
+    url: u(`/api/v3/repos/${repo.fullName}/commits/${sha}`),
+    author: {
+      name: String(stored.authorName ?? ''),
+      email: String(stored.authorEmail ?? ''),
+      username: VIEWER_LOGIN,
+    },
+    distinct: stored.distinct !== false,
+  };
+}
+
+/**
+ * One activity event in the repository/user feed shape. The stored payload holds references
+ * (issue numbers, comment ids, commit shas); they expand here against the repo's current
+ * records, so the feed renders the same objects every other surface serves.
+ */
+export function eventJson(repo: Repo | null, event: EventRec): Json {
+  const stored = event.payload;
+  const payload: Json = {};
+  if (event.type === 'PushEvent') {
+    const commits = Array.isArray(stored.commits) ? (stored.commits as Array<Record<string, unknown>>) : [];
+    payload.ref = stored.ref;
+    payload.before = stored.before;
+    payload.after = stored.after;
+    payload.created = false;
+    payload.deleted = false;
+    payload.forced = false;
+    payload.base_ref = null;
+    payload.compare = repo ? u(`/${repo.fullName}/compare/${String(stored.before)}...${String(stored.after)}`) : null;
+    payload.commits = repo ? commits.map((commit) => pushCommitJson(repo, commit)) : [];
+    payload.head_commit = repo && commits.length > 0 ? pushCommitJson(repo, commits[0]) : null;
+    payload.size = stored.size;
+    payload.distinct_size = stored.distinct_size;
+  } else if (event.type === 'IssuesEvent' || event.type === 'PullRequestEvent') {
+    payload.action = stored.action;
+    const number = Number(stored.issueNumber ?? 0);
+    payload.number = number;
+    const issue = repo?.issues.get(number);
+    if (issue && repo) payload.issue = issueJson(repo, issue);
+    if (typeof stored.label === 'string' && repo) {
+      const label = repo.labels.get(stored.label);
+      if (label) payload.label = labelJson(repo, label);
+    }
+  } else if (event.type === 'IssueCommentEvent') {
+    payload.action = stored.action;
+    const issue = repo?.issues.get(Number(stored.issueNumber ?? 0));
+    if (issue && repo) {
+      payload.issue = issueJson(repo, issue);
+      const comment = issue.comments.find((item) => item.id === Number(stored.commentId ?? 0));
+      if (comment) payload.comment = commentJson(repo, issue, comment);
+    }
+  } else {
+    Object.assign(payload, stored);
+  }
+  return {
+    id: String(event.id),
+    type: event.type,
+    actor: userJson(event.actorLogin),
+    repo: {
+      id: event.repoId,
+      name: event.repoFullName,
+      url: u(`/api/v3/repos/${event.repoFullName}`),
+    },
+    payload,
+    public: true,
+    created_at: isoOf(event.createdAt),
+  };
+}
+
+/**
+ * One entry of an issue's own event timeline (GET /repos/{owner}/{repo}/issues/{number}/events):
+ * the smaller per-issue shape, or null when the stored event is not part of that timeline.
+ */
+export function issueEventJson(repo: Repo, event: EventRec): Json | null {
+  const stored = event.payload;
+  let name: string | null = null;
+  if (event.type === 'IssueCommentEvent') name = 'commented';
+  else if (event.type === 'IssuesEvent') {
+    if (stored.action === 'closed') name = 'closed';
+    else if (stored.action === 'reopened') name = 'reopened';
+    else if (stored.action === 'labeled') name = 'labeled';
+    else if (stored.action === 'unlabeled') name = 'unlabeled';
+  } else if (event.type === 'PullRequestEvent') {
+    if (stored.action === 'closed') {
+      const issue = repo.issues.get(Number(stored.issueNumber ?? 0));
+      name = issue?.pull?.merged ? 'merged' : 'closed';
+    } else if (stored.action === 'reopened') name = 'reopened';
+    else if (stored.action === 'labeled') name = 'labeled';
+    else if (stored.action === 'unlabeled') name = 'unlabeled';
+  }
+  if (name === null) return null;
+  const out: Json = {
+    id: event.id,
+    node_id: nodeId('IssueEvent', `${repo.id}:${event.id}`),
+    url: u(`/api/v3/repos/${repo.fullName}/issues/events/${event.id}`),
+    actor: userJson(event.actorLogin),
+    event: name,
+    commit_id: null,
+    commit_url: null,
+    created_at: isoOf(event.createdAt),
+  };
+  if ((name === 'labeled' || name === 'unlabeled') && typeof stored.label === 'string') {
+    const label = repo.labels.get(stored.label);
+    if (label) out.label = labelJson(repo, label);
   }
   return out;
 }

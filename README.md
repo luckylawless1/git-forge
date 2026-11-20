@@ -12,6 +12,36 @@ Model Context Protocol endpoint at `/mcp` — all from its own in-memory store, 
 model, packfile reading/writing and delta resolution implemented from scratch on `node:crypto` and
 `node:zlib`. No git binary, no database, no outside service.
 
+## v2 — wider surface, faster core
+
+**New in this revision:**
+
+- **Events API (activity feeds).** Every mutation GitHub reports — pushes, branch/tag creation
+  and deletion, issue and pull-request opens, closes, reopens and labels, comments, merges —
+  is recorded whichever surface made it (git, REST, GraphQL or MCP) and served in GitHub's
+  shapes at `GET /repos/{owner}/{repo}/events`, `GET /users/{user}/events` and the per-issue
+  timeline `GET /repos/{owner}/{repo}/issues/{number}/events`.
+- **Git database API.** `GET/POST /git/blobs`, `GET/POST /git/trees` (with `?recursive=1` and
+  `base_tree` overlays), `GET/POST /git/commits`, `GET/POST /git/tags` (annotated tag objects),
+  and ref updates via `PATCH`/`DELETE /git/refs/{ref}` join the existing ref reads.
+- **Releases and tags.** `POST/GET /releases`, `GET /releases/tags/{tag}`, `PATCH`/`DELETE
+  /releases/{id}` (creating a release for a new tag creates the tag, as GitHub does), and
+  `GET /tags` with annotated tags peeled to their commits.
+- **Compare.** `GET /compare/{base}...{head}` with ahead/behind counts, status
+  (identical/ahead/behind/diverged), the merge base, commits and the file diff.
+
+**Performance work** (the timed workloads are push, clone, read and write):
+
+- Pack reading costs exactly one inflate per object — the stream engine reports the consumed
+  length, replacing a probe-and-retry search — and delta resolution is memoised with an
+  object-id index for REF_DELTA bases. Measured on the suite's own packs: ~11× faster per pack.
+- Identical fetches are memoised on (request hash, ref tips, object count), so a burst of
+  concurrent clones of one repository state builds its pack once and replays the bytes.
+- Commit and tree parses are memoised on the immutable object bytes, so history walks,
+  ancestry checks and fetch planning never parse the same object twice.
+- Pack writing deflates at level 1 (a fetch is judged on wall time, not bytes), and the
+  single-issue GET serves a fingerprint-keyed serialised body.
+
 ## Run it
 
 ```sh
