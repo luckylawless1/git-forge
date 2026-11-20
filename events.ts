@@ -93,3 +93,22 @@ export function recordCommentEvent(forge: Forge, repo: Repo, issue: IssueRec, co
     commentId,
   });
 }
+
+/**
+ * Record a release lifecycle action (published, created for a draft, edited, deleted), as
+ * GitHub's feeds carry ReleaseEvent. The tag and name ride along so the feed entry still
+ * renders after the release itself is deleted.
+ */
+export function recordReleaseEvent(
+  forge: Forge,
+  repo: Repo,
+  action: string,
+  release: { id: number; tagName: string; name: string | null },
+): void {
+  forge.recordEvent('ReleaseEvent', repo, {
+    action,
+    releaseId: release.id,
+    tagName: release.tagName,
+    releaseName: release.name,
+  });
+}

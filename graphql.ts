@@ -2,8 +2,9 @@
 // variables, inline enum/object/list literals, batched operations), resolvers over the same store
 // REST and MCP use, and introspection that describes the schema back.
 
-import { parseCommit, parseTree, peelToCommit } from './git.ts';
+import { ZERO_OID, flattenTree, parseCommit, parseTree, peelToCommit } from './git.ts';
 import { diffTrees, planMerge } from './diff.ts';
+import { recordIssueEvent, recordRefUpdate } from './events.ts';
 import { parseGraphQL, valueOf, type SelectionNode } from './gqlparse.ts';
 import { addCommentRecord, createIssueRecord, createPullRecord, mergePull } from './ops.ts';
 import {
@@ -12,8 +13,10 @@ import {
   forge,
   isoOf,
   nodeId,
+  nowDate,
   type IssueRec,
   type LabelRec,
+  type ReleaseRec,
   type Repo,
 } from './store.ts';
 
@@ -84,6 +87,8 @@ const SCHEMA: Record<string, TypeDef> = {
   Base64String: { kind: 'SCALAR' },
   HTML: { kind: 'SCALAR' },
   IssueState: { kind: 'ENUM', values: ['OPEN', 'CLOSED'] },
+  IssueStateReason: { kind: 'ENUM', values: ['COMPLETED', 'NOT_PLANNED', 'REOPENED', 'DUPLICATE'] },
+  ReleaseOrderField: { kind: 'ENUM', values: ['CREATED_AT', 'NAME'] },
   PullRequestState: { kind: 'ENUM', values: ['OPEN', 'CLOSED', 'MERGED'] },
   MergeableState: { kind: 'ENUM', values: ['MERGEABLE', 'CONFLICTING', 'UNKNOWN'] },
   MergeStateStatus: { kind: 'ENUM', values: ['BEHIND', 'BLOCKED', 'CLEAN', 'DIRTY', 'DRAFT', 'HAS_HOOKS', 'UNKNOWN', 'UNSTABLE'] },
@@ -102,6 +107,7 @@ const SCHEMA: Record<string, TypeDef> = {
   RefOrder: { kind: 'INPUT_OBJECT', inputFields: { field: { type: 'RefOrderField!' }, direction: { type: 'OrderDirection!' } } },
   LabelOrder: { kind: 'INPUT_OBJECT', inputFields: { field: { type: 'LabelOrderField!' }, direction: { type: 'OrderDirection!' } } },
   IssueCommentOrder: { kind: 'INPUT_OBJECT', inputFields: { field: { type: 'IssueCommentOrderField!' }, direction: { type: 'OrderDirection!' } } },
+  ReleaseOrder: { kind: 'INPUT_OBJECT', inputFields: { field: { type: 'ReleaseOrderField!' }, direction: { type: 'OrderDirection!' } } },
   CreateIssueInput: {
     kind: 'INPUT_OBJECT',
     inputFields: {
@@ -128,11 +134,27 @@ const SCHEMA: Record<string, TypeDef> = {
     },
   },
   AddCommentInput: { kind: 'INPUT_OBJECT', inputFields: { subjectId: { type: 'ID!' }, body: { type: 'String!' }, clientMutationId: { type: 'String' } } },
+  UpdateIssueInput: {
+    kind: 'INPUT_OBJECT',
+    inputFields: {
+      id: { type: 'ID!' }, title: { type: 'String' }, body: { type: 'String' },
+      state: { type: 'IssueState' }, labelIds: { type: '[ID!]' }, clientMutationId: { type: 'String' },
+    },
+  },
+  ClosePullRequestInput: { kind: 'INPUT_OBJECT', inputFields: { pullRequestId: { type: 'ID!' }, clientMutationId: { type: 'String' } } },
+  ReopenPullRequestInput: { kind: 'INPUT_OBJECT', inputFields: { pullRequestId: { type: 'ID!' }, clientMutationId: { type: 'String' } } },
+  AddLabelsToLabelableInput: { kind: 'INPUT_OBJECT', inputFields: { labelableId: { type: 'ID!' }, labelIds: { type: '[ID!]!' }, clientMutationId: { type: 'String' } } },
+  RemoveLabelsFromLabelableInput: { kind: 'INPUT_OBJECT', inputFields: { labelableId: { type: 'ID!' }, labelIds: { type: '[ID!]!' }, clientMutationId: { type: 'String' } } },
+  CreateRefInput: { kind: 'INPUT_OBJECT', inputFields: { repositoryId: { type: 'ID!' }, name: { type: 'String!' }, oid: { type: 'GitObjectID!' }, clientMutationId: { type: 'String' } } },
+  DeleteRefInput: { kind: 'INPUT_OBJECT', inputFields: { refId: { type: 'ID!' }, clientMutationId: { type: 'String' } } },
+  UpdateIssueCommentInput: { kind: 'INPUT_OBJECT', inputFields: { id: { type: 'ID!' }, body: { type: 'String!' }, clientMutationId: { type: 'String' } } },
+  DeleteIssueCommentInput: { kind: 'INPUT_OBJECT', inputFields: { id: { type: 'ID!' }, clientMutationId: { type: 'String' } } },
   Query: {
     kind: 'OBJECT',
     fields: {
       viewer: { type: 'User!' },
       repository: { type: 'Repository', args: { owner: { type: 'String!' }, name: { type: 'String!' } } },
+      repositoryOwner: { type: 'RepositoryOwner', args: { login: { type: 'String!' } } },
       node: { type: 'Node', args: { id: { type: 'ID!' } } },
       nodes: { type: '[Node]!', args: { ids: { type: '[ID!]!' } } },
       user: { type: 'User', args: { login: { type: 'String!' } } },
@@ -152,6 +174,15 @@ const SCHEMA: Record<string, TypeDef> = {
       createPullRequest: { type: 'CreatePullRequestPayload', args: { input: { type: 'CreatePullRequestInput!' } } },
       mergePullRequest: { type: 'MergePullRequestPayload', args: { input: { type: 'MergePullRequestInput!' } } },
       addComment: { type: 'AddCommentPayload', args: { input: { type: 'AddCommentInput!' } } },
+      updateIssue: { type: 'UpdateIssuePayload', args: { input: { type: 'UpdateIssueInput!' } } },
+      closePullRequest: { type: 'ClosePullRequestPayload', args: { input: { type: 'ClosePullRequestInput!' } } },
+      reopenPullRequest: { type: 'ReopenPullRequestPayload', args: { input: { type: 'ReopenPullRequestInput!' } } },
+      addLabelsToLabelable: { type: 'AddLabelsToLabelablePayload', args: { input: { type: 'AddLabelsToLabelableInput!' } } },
+      removeLabelsFromLabelable: { type: 'RemoveLabelsFromLabelablePayload', args: { input: { type: 'RemoveLabelsFromLabelableInput!' } } },
+      createRef: { type: 'CreateRefPayload', args: { input: { type: 'CreateRefInput!' } } },
+      deleteRef: { type: 'DeleteRefPayload', args: { input: { type: 'DeleteRefInput!' } } },
+      updateIssueComment: { type: 'UpdateIssueCommentPayload', args: { input: { type: 'UpdateIssueCommentInput!' } } },
+      deleteIssueComment: { type: 'DeleteIssueCommentPayload', args: { input: { type: 'DeleteIssueCommentInput!' } } },
     },
   },
   Node: { kind: 'INTERFACE', fields: { id: { type: 'ID!' } } },
@@ -216,6 +247,8 @@ const SCHEMA: Record<string, TypeDef> = {
       },
       label: { type: 'Label', args: { name: { type: 'String!' } } },
       labels: { type: 'LabelConnection!', args: { ...connArgs, orderBy: { type: 'LabelOrder' }, query: { type: 'String' } } },
+      release: { type: 'Release', args: { tagName: { type: 'String!' } } },
+      releases: { type: 'ReleaseConnection!', args: { ...connArgs, orderBy: { type: 'ReleaseOrder' } } },
       ref: { type: 'Ref', args: { qualifiedName: { type: 'String!' } } },
       refs: { type: 'RefConnection!', args: { ...connArgs, refPrefix: { type: 'String!' }, orderBy: { type: 'RefOrder' }, query: { type: 'String' } } },
       object: { type: 'GitObject', args: { expression: { type: 'String' }, oid: { type: 'GitObjectID' } } },
@@ -232,6 +265,8 @@ const SCHEMA: Record<string, TypeDef> = {
       bodyText: { type: 'String' },
       bodyHTML: { type: 'HTML' },
       state: { type: 'IssueState!' },
+      stateReason: { type: 'IssueStateReason' },
+      locked: { type: 'Boolean!' },
       closed: { type: 'Boolean!' },
       closedAt: { type: 'DateTime' },
       createdAt: { type: 'DateTime!' },
@@ -321,6 +356,28 @@ const SCHEMA: Record<string, TypeDef> = {
       repository: { type: 'Repository!' },
     },
   },
+  Release: {
+    kind: 'OBJECT',
+    fields: {
+      id: { type: 'ID!' },
+      databaseId: { type: 'Int' },
+      name: { type: 'String' },
+      tagName: { type: 'String!' },
+      targetCommitish: { type: 'String' },
+      isDraft: { type: 'Boolean!' },
+      isPrerelease: { type: 'Boolean!' },
+      isLatest: { type: 'Boolean!' },
+      createdAt: { type: 'DateTime!' },
+      publishedAt: { type: 'DateTime' },
+      updatedAt: { type: 'DateTime!' },
+      url: { type: 'URI!' },
+      description: { type: 'String' },
+      descriptionHTML: { type: 'HTML' },
+      author: { type: 'Actor' },
+      repository: { type: 'Repository!' },
+      tag: { type: 'Ref' },
+    },
+  },
   Ref: {
     kind: 'OBJECT',
     fields: {
@@ -357,6 +414,10 @@ const SCHEMA: Record<string, TypeDef> = {
       tree: { type: 'Tree!' },
       treeOid: { type: 'GitObjectID!' },
       parents: { type: 'CommitConnection!', args: { ...connArgs } },
+      history: {
+        type: 'CommitHistoryConnection!',
+        args: { ...connArgs, path: { type: 'String' }, since: { type: 'DateTime' }, until: { type: 'DateTime' } },
+      },
       url: { type: 'URI!' },
       repository: { type: 'Repository!' },
       additions: { type: 'Int' },
@@ -434,6 +495,16 @@ const SCHEMA: Record<string, TypeDef> = {
   CreatePullRequestPayload: { kind: 'OBJECT', fields: { clientMutationId: { type: 'String' }, pullRequest: { type: 'PullRequest' } } },
   MergePullRequestPayload: { kind: 'OBJECT', fields: { clientMutationId: { type: 'String' }, pullRequest: { type: 'PullRequest' } } },
   AddCommentPayload: { kind: 'OBJECT', fields: { clientMutationId: { type: 'String' }, commentEdge: { type: 'IssueCommentEdge' }, subject: { type: 'Node' } } },
+  UpdateIssuePayload: { kind: 'OBJECT', fields: { clientMutationId: { type: 'String' }, issue: { type: 'Issue' } } },
+  ClosePullRequestPayload: { kind: 'OBJECT', fields: { clientMutationId: { type: 'String' }, pullRequest: { type: 'PullRequest' } } },
+  ReopenPullRequestPayload: { kind: 'OBJECT', fields: { clientMutationId: { type: 'String' }, pullRequest: { type: 'PullRequest' } } },
+  AddLabelsToLabelablePayload: { kind: 'OBJECT', fields: { clientMutationId: { type: 'String' }, labelable: { type: 'Labelable' } } },
+  RemoveLabelsFromLabelablePayload: { kind: 'OBJECT', fields: { clientMutationId: { type: 'String' }, labelable: { type: 'Labelable' } } },
+  CreateRefPayload: { kind: 'OBJECT', fields: { clientMutationId: { type: 'String' }, ref: { type: 'Ref' } } },
+  DeleteRefPayload: { kind: 'OBJECT', fields: { clientMutationId: { type: 'String' }, deletedRefId: { type: 'ID' } } },
+  UpdateIssueCommentPayload: { kind: 'OBJECT', fields: { clientMutationId: { type: 'String' }, issueComment: { type: 'IssueComment' } } },
+  DeleteIssueCommentPayload: { kind: 'OBJECT', fields: { clientMutationId: { type: 'String' }, deletedCommentId: { type: 'ID' } } },
+  Labelable: { kind: 'INTERFACE', fields: { id: { type: 'ID!' } } },
 };
 
 // Connection and edge types, generated for each node type they carry.
@@ -446,6 +517,8 @@ const CONNECTION_OF: Record<string, string> = {
   RepositoryConnection: 'Repository',
   IssueCommentConnection: 'IssueComment',
   CommitConnection: 'Commit',
+  CommitHistoryConnection: 'Commit',
+  ReleaseConnection: 'Release',
   PullRequestCommitConnection: 'PullRequestCommit',
   PullRequestChangedFileConnection: 'PullRequestChangedFile',
   SearchResultItemConnection: 'SearchResultItem',
@@ -572,6 +645,7 @@ const repoValue = (repo: Repo): Value => ({ __typename: 'Repository', repo });
 const issueValue = (repo: Repo, rec: IssueRec): Value => ({ __typename: 'Issue', repo, rec });
 const prValue = (repo: Repo, rec: IssueRec): Value => ({ __typename: 'PullRequest', repo, rec });
 const labelValue = (repo: Repo, label: LabelRec): Value => ({ __typename: 'Label', repo, label });
+const releaseValue = (repo: Repo, release: ReleaseRec): Value => ({ __typename: 'Release', repo, release });
 const refValue = (repo: Repo, ref: string): Value => ({ __typename: 'Ref', repo, ref });
 const commitValue = (repo: Repo, oid: string): Value => ({ __typename: 'Commit', repo, oid });
 const treeValue = (repo: Repo, oid: string): Value => ({ __typename: 'Tree', repo, oid });
@@ -722,6 +796,30 @@ function nodeForId(id: string): Value | null {
       }
     }
   }
+  if (decoded.kind === 'Release') {
+    for (const repo of forge.listRepos()) {
+      const release = repo.releases.get(Number(decoded.key));
+      if (release) return releaseValue(repo, release);
+    }
+  }
+  if (decoded.kind === 'Label') {
+    const [repoId, ...rest] = decoded.key.split(':');
+    const repo = forge.reposById.get(Number(repoId));
+    const label = repo?.labels.get(rest.join(':'));
+    if (repo && label) return labelValue(repo, label);
+  }
+  if (decoded.kind === 'Ref') {
+    const [repoId, ...rest] = decoded.key.split(':');
+    const repo = forge.reposById.get(Number(repoId));
+    const ref = rest.join(':');
+    if (repo && repo.refs.has(ref)) return refValue(repo, ref);
+  }
+  if (decoded.kind === 'Commit') {
+    for (const repo of forge.listRepos()) {
+      const object = repo.objects.get(decoded.key);
+      if (object && object.type === 'commit') return commitValue(repo, decoded.key);
+    }
+  }
   return null;
 }
 
@@ -731,6 +829,7 @@ def('Query', {
     const repo = forge.getRepo(String(args.owner), String(args.name));
     return repo ? repoValue(repo) : null;
   },
+  repositoryOwner: (_s, args) => (args.login === VIEWER_LOGIN ? userValue(VIEWER_LOGIN) : null),
   node: (_s, args) => nodeForId(String(args.id)),
   nodes: (_s, args) => (Array.isArray(args.ids) ? args.ids.map((id) => nodeForId(String(id))) : []),
   user: (_s, args) => (args.login === VIEWER_LOGIN ? userValue(VIEWER_LOGIN) : null),
@@ -796,21 +895,29 @@ def('Mutation', {
     const input = (args.input ?? {}) as Record<string, unknown>;
     const value = nodeForId(String(input.issueId ?? ''));
     if (!value || (value.__typename !== 'Issue' && value.__typename !== 'PullRequest')) throw new Error('the issueId does not name an issue');
+    const repo = value.repo as Repo;
     const rec = value.rec as IssueRec;
-    rec.state = 'closed';
-    rec.closedAt = new Date();
-    rec.updatedAt = new Date();
-    return { __typename: 'CloseIssuePayload', clientMutationId: (input.clientMutationId as string) ?? null, issue: issueValue(value.repo as Repo, rec) };
+    if (rec.state !== 'closed') {
+      rec.state = 'closed';
+      rec.closedAt = nowDate();
+      recordIssueEvent(forge, repo, 'closed', rec);
+    }
+    rec.updatedAt = nowDate();
+    return { __typename: 'CloseIssuePayload', clientMutationId: (input.clientMutationId as string) ?? null, issue: issueValue(repo, rec) };
   },
   reopenIssue: (_s, args) => {
     const input = (args.input ?? {}) as Record<string, unknown>;
     const value = nodeForId(String(input.issueId ?? ''));
     if (!value) throw new Error('the issueId does not name an issue');
+    const repo = value.repo as Repo;
     const rec = value.rec as IssueRec;
-    rec.state = 'open';
-    rec.closedAt = null;
-    rec.updatedAt = new Date();
-    return { __typename: 'ReopenIssuePayload', clientMutationId: (input.clientMutationId as string) ?? null, issue: issueValue(value.repo as Repo, rec) };
+    if (rec.state !== 'open') {
+      rec.state = 'open';
+      rec.closedAt = null;
+      recordIssueEvent(forge, repo, 'reopened', rec);
+    }
+    rec.updatedAt = nowDate();
+    return { __typename: 'ReopenIssuePayload', clientMutationId: (input.clientMutationId as string) ?? null, issue: issueValue(repo, rec) };
   },
   createPullRequest: (_s, args) => {
     const input = (args.input ?? {}) as Record<string, unknown>;
@@ -853,6 +960,153 @@ def('Mutation', {
       commentEdge: { __typename: 'IssueCommentEdge', __node: commentValue(repo, rec, comment), __cursor: cursorFor(rec.comments.length - 1) },
       subject: value,
     };
+  },
+  updateIssue: (_s, args) => {
+    const input = (args.input ?? {}) as Record<string, unknown>;
+    const value = nodeForId(String(input.id ?? ''));
+    if (!value || (value.__typename !== 'Issue' && value.__typename !== 'PullRequest')) throw new Error('the id does not name an issue');
+    const repo = value.repo as Repo;
+    const rec = value.rec as IssueRec;
+    if (typeof input.title === 'string') rec.title = input.title;
+    if (typeof input.body === 'string') rec.body = input.body;
+    if (Array.isArray(input.labelIds)) {
+      const next: string[] = [];
+      for (const labelId of input.labelIds) {
+        const labelDecoded = decodeNodeId(String(labelId));
+        const name = labelDecoded?.key.split(':').slice(1).join(':');
+        if (name && repo.labels.has(name) && !next.includes(name)) next.push(name);
+      }
+      for (const name of next) if (!rec.labels.includes(name)) recordIssueEvent(forge, repo, 'labeled', rec, name);
+      for (const name of rec.labels) if (!next.includes(name)) recordIssueEvent(forge, repo, 'unlabeled', rec, name);
+      rec.labels = next;
+    }
+    if (input.state === 'CLOSED' && rec.state !== 'closed') {
+      rec.state = 'closed';
+      rec.closedAt = nowDate();
+      recordIssueEvent(forge, repo, 'closed', rec);
+    } else if (input.state === 'OPEN' && rec.state !== 'open') {
+      rec.state = 'open';
+      rec.closedAt = null;
+      recordIssueEvent(forge, repo, 'reopened', rec);
+    }
+    rec.updatedAt = nowDate();
+    return { __typename: 'UpdateIssuePayload', clientMutationId: (input.clientMutationId as string) ?? null, issue: issueValue(repo, rec) };
+  },
+  closePullRequest: (_s, args) => {
+    const input = (args.input ?? {}) as Record<string, unknown>;
+    const value = nodeForId(String(input.pullRequestId ?? ''));
+    if (!value || value.__typename !== 'PullRequest') throw new Error('the pullRequestId does not name a pull request');
+    const repo = value.repo as Repo;
+    const rec = value.rec as IssueRec;
+    if (rec.state !== 'closed') {
+      rec.state = 'closed';
+      rec.closedAt = nowDate();
+      recordIssueEvent(forge, repo, 'closed', rec);
+    }
+    rec.updatedAt = nowDate();
+    return { __typename: 'ClosePullRequestPayload', clientMutationId: (input.clientMutationId as string) ?? null, pullRequest: prValue(repo, rec) };
+  },
+  reopenPullRequest: (_s, args) => {
+    const input = (args.input ?? {}) as Record<string, unknown>;
+    const value = nodeForId(String(input.pullRequestId ?? ''));
+    if (!value || value.__typename !== 'PullRequest') throw new Error('the pullRequestId does not name a pull request');
+    const repo = value.repo as Repo;
+    const rec = value.rec as IssueRec;
+    if ((rec.pull as IssueRec['pull'])?.merged) throw new Error('the pull request was merged and cannot be reopened');
+    if (rec.state !== 'open') {
+      rec.state = 'open';
+      rec.closedAt = null;
+      recordIssueEvent(forge, repo, 'reopened', rec);
+    }
+    rec.updatedAt = nowDate();
+    return { __typename: 'ReopenPullRequestPayload', clientMutationId: (input.clientMutationId as string) ?? null, pullRequest: prValue(repo, rec) };
+  },
+  addLabelsToLabelable: (_s, args) => {
+    const input = (args.input ?? {}) as Record<string, unknown>;
+    const value = nodeForId(String(input.labelableId ?? ''));
+    if (!value || (value.__typename !== 'Issue' && value.__typename !== 'PullRequest')) throw new Error('the labelableId does not name an issue or pull request');
+    const repo = value.repo as Repo;
+    const rec = value.rec as IssueRec;
+    if (Array.isArray(input.labelIds)) {
+      for (const labelId of input.labelIds) {
+        const labelDecoded = decodeNodeId(String(labelId));
+        const name = labelDecoded?.key.split(':').slice(1).join(':');
+        if (name && repo.labels.has(name) && !rec.labels.includes(name)) {
+          rec.labels.push(name);
+          recordIssueEvent(forge, repo, 'labeled', rec, name);
+        }
+      }
+    }
+    rec.updatedAt = nowDate();
+    return { __typename: 'AddLabelsToLabelablePayload', clientMutationId: (input.clientMutationId as string) ?? null, labelable: value };
+  },
+  removeLabelsFromLabelable: (_s, args) => {
+    const input = (args.input ?? {}) as Record<string, unknown>;
+    const value = nodeForId(String(input.labelableId ?? ''));
+    if (!value || (value.__typename !== 'Issue' && value.__typename !== 'PullRequest')) throw new Error('the labelableId does not name an issue or pull request');
+    const repo = value.repo as Repo;
+    const rec = value.rec as IssueRec;
+    if (Array.isArray(input.labelIds)) {
+      for (const labelId of input.labelIds) {
+        const labelDecoded = decodeNodeId(String(labelId));
+        const name = labelDecoded?.key.split(':').slice(1).join(':');
+        if (name && rec.labels.includes(name)) {
+          rec.labels = rec.labels.filter((item) => item !== name);
+          recordIssueEvent(forge, repo, 'unlabeled', rec, name);
+        }
+      }
+    }
+    rec.updatedAt = nowDate();
+    return { __typename: 'RemoveLabelsFromLabelablePayload', clientMutationId: (input.clientMutationId as string) ?? null, labelable: value };
+  },
+  createRef: (_s, args) => {
+    const input = (args.input ?? {}) as Record<string, unknown>;
+    const decoded = decodeNodeId(String(input.repositoryId ?? ''));
+    const repo = decoded ? forge.reposById.get(Number(decoded.key)) : undefined;
+    if (!repo) throw new Error('the repositoryId does not name a repository');
+    const name = String(input.name ?? '');
+    const oid = String(input.oid ?? '');
+    if (!name.startsWith('refs/')) throw new Error('the ref name must be fully qualified');
+    if (!repo.objects.has(oid)) throw new Error('the oid does not name an object in the repository');
+    if (repo.refs.has(name)) throw new Error('the ref already exists');
+    repo.refs.set(name, oid);
+    recordRefUpdate(forge, repo, name, ZERO_OID, oid);
+    return { __typename: 'CreateRefPayload', clientMutationId: (input.clientMutationId as string) ?? null, ref: refValue(repo, name) };
+  },
+  deleteRef: (_s, args) => {
+    const input = (args.input ?? {}) as Record<string, unknown>;
+    const value = nodeForId(String(input.refId ?? ''));
+    if (!value || value.__typename !== 'Ref') throw new Error('the refId does not name a ref');
+    const repo = value.repo as Repo;
+    const ref = value.ref as string;
+    const current = repo.refs.get(ref);
+    if (current) {
+      repo.refs.delete(ref);
+      recordRefUpdate(forge, repo, ref, current, ZERO_OID);
+    }
+    return { __typename: 'DeleteRefPayload', clientMutationId: (input.clientMutationId as string) ?? null, deletedRefId: String(input.refId) };
+  },
+  updateIssueComment: (_s, args) => {
+    const input = (args.input ?? {}) as Record<string, unknown>;
+    const value = nodeForId(String(input.id ?? ''));
+    if (!value || value.__typename !== 'IssueComment') throw new Error('the id does not name a comment');
+    const repo = value.repo as Repo;
+    const rec = value.rec as IssueRec;
+    const comment = value.comment as IssueRec['comments'][number];
+    comment.body = String(input.body ?? '');
+    comment.updatedAt = nowDate();
+    rec.updatedAt = nowDate();
+    return { __typename: 'UpdateIssueCommentPayload', clientMutationId: (input.clientMutationId as string) ?? null, issueComment: commentValue(repo, rec, comment) };
+  },
+  deleteIssueComment: (_s, args) => {
+    const input = (args.input ?? {}) as Record<string, unknown>;
+    const value = nodeForId(String(input.id ?? ''));
+    if (!value || value.__typename !== 'IssueComment') throw new Error('the id does not name a comment');
+    const rec = value.rec as IssueRec;
+    const comment = value.comment as IssueRec['comments'][number];
+    rec.comments = rec.comments.filter((item) => item.id !== comment.id);
+    rec.updatedAt = nowDate();
+    return { __typename: 'DeleteIssueCommentPayload', clientMutationId: (input.clientMutationId as string) ?? null, deletedCommentId: String(input.id) };
   },
 });
 
@@ -913,6 +1167,20 @@ def('Repository', {
     return rec?.pull ? prValue(repo, rec) : null;
   },
   pullRequests: (s, args) => prConnection(s.repo as Repo, args),
+  release: (s, args) => {
+    const repo = s.repo as Repo;
+    const release = [...repo.releases.values()].find((item) => item.tagName === String(args.tagName));
+    return release ? releaseValue(repo, release) : null;
+  },
+  releases: (s, args) => {
+    const repo = s.repo as Repo;
+    const orderBy = (args.orderBy ?? {}) as { field?: string; direction?: string };
+    const all = [...repo.releases.values()];
+    if (orderBy.field === 'NAME') all.sort((a, b) => (a.tagName < b.tagName ? -1 : 1));
+    else all.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id - b.id);
+    if (orderBy.direction !== 'ASC') all.reverse();
+    return connectionValue('ReleaseConnection', all.map((release) => releaseValue(repo, release)), args as PageArgs);
+  },
   label: (s, args) => {
     const repo = s.repo as Repo;
     const label = repo.labels.get(String(args.name));
@@ -966,6 +1234,8 @@ def('Issue', {
   bodyText: (s) => (s.rec as IssueRec).body ?? '',
   bodyHTML: (s) => (s.rec as IssueRec).body ?? '',
   state: (s) => ((s.rec as IssueRec).state === 'open' ? 'OPEN' : 'CLOSED'),
+  stateReason: (s) => ((s.rec as IssueRec).state === 'closed' ? 'COMPLETED' : null),
+  locked: () => false,
   closed: (s) => (s.rec as IssueRec).state === 'closed',
   closedAt: (s) => isoDate((s.rec as IssueRec).closedAt),
   createdAt: (s) => isoDate((s.rec as IssueRec).createdAt),
@@ -1120,6 +1390,37 @@ def('Label', {
   repository: (s) => repoValue(s.repo as Repo),
 });
 
+def('Release', {
+  id: (s) => nodeId('Release', (s.release as ReleaseRec).id),
+  databaseId: (s) => (s.release as ReleaseRec).id,
+  name: (s) => (s.release as ReleaseRec).name,
+  tagName: (s) => (s.release as ReleaseRec).tagName,
+  targetCommitish: (s) => (s.release as ReleaseRec).targetCommitish,
+  isDraft: (s) => (s.release as ReleaseRec).draft,
+  isPrerelease: (s) => (s.release as ReleaseRec).prerelease,
+  isLatest: (s) => {
+    const repo = s.repo as Repo;
+    const me = s.release as ReleaseRec;
+    if (me.draft || me.prerelease) return false;
+    const published = [...repo.releases.values()].filter((item) => !item.draft && !item.prerelease);
+    published.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id - b.id);
+    return published.length > 0 && published[published.length - 1].id === me.id;
+  },
+  createdAt: (s) => isoDate((s.release as ReleaseRec).createdAt),
+  publishedAt: (s) => isoDate((s.release as ReleaseRec).publishedAt),
+  updatedAt: (s) => isoDate((s.release as ReleaseRec).publishedAt ?? (s.release as ReleaseRec).createdAt),
+  url: (s) => `/${(s.repo as Repo).fullName}/releases/tag/${encodeURIComponent((s.release as ReleaseRec).tagName)}`,
+  description: (s) => (s.release as ReleaseRec).body,
+  descriptionHTML: (s) => (s.release as ReleaseRec).body ?? '',
+  author: (s) => userValue((s.repo as Repo).owner),
+  repository: (s) => repoValue(s.repo as Repo),
+  tag: (s) => {
+    const repo = s.repo as Repo;
+    const ref = `refs/tags/${(s.release as ReleaseRec).tagName}`;
+    return repo.refs.has(ref) ? refValue(repo, ref) : null;
+  },
+});
+
 def('Ref', {
   id: (s) => nodeId('Ref', `${(s.repo as Repo).id}:${s.ref as string}`),
   name: (s) => {
@@ -1161,6 +1462,39 @@ def('Commit', {
   parents: (s, args) => {
     const repo = s.repo as Repo;
     return connectionValue('CommitConnection', commitOf(s).parents.map((oid) => commitValue(repo, oid)), args as PageArgs);
+  },
+  history: (s, args) => {
+    const repo = s.repo as Repo;
+    let oids = repo.listCommits(s.oid as string, 1000);
+    const since = typeof args.since === 'string' ? Date.parse(args.since) / 1000 : null;
+    const until = typeof args.until === 'string' ? Date.parse(args.until) / 1000 : null;
+    if (since !== null || until !== null) {
+      oids = oids.filter((oid) => {
+        const object = repo.objects.get(oid);
+        if (!object || object.type !== 'commit') return false;
+        const epoch = parseCommit(object.data).committerEpoch;
+        return (since === null || epoch >= since) && (until === null || epoch <= until);
+      });
+    }
+    if (typeof args.path === 'string' && args.path !== '') {
+      // A commit is in a path's history when the path's content differs from its first
+      // parent's (or the commit is a root that has the path at all).
+      const path = args.path.replace(/^\.\//, '');
+      const filesOf = (oid: string): Map<string, string> => {
+        const object = repo.objects.get(oid);
+        if (!object || object.type !== 'commit') return new Map();
+        return flattenTree(repo.objects, parseCommit(object.data).tree);
+      };
+      oids = oids.filter((oid) => {
+        const object = repo.objects.get(oid);
+        if (!object || object.type !== 'commit') return false;
+        const parents = parseCommit(object.data).parents;
+        const mine = filesOf(oid).get(path);
+        if (parents.length === 0) return mine !== undefined;
+        return mine !== filesOf(parents[0]).get(path);
+      });
+    }
+    return connectionValue('CommitHistoryConnection', oids.map((oid) => commitValue(repo, oid)), args as PageArgs);
   },
   url: (s) => `/${(s.repo as Repo).fullName}/commit/${s.oid as string}`,
   repository: (s) => repoValue(s.repo as Repo),

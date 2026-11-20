@@ -42,6 +42,54 @@ model, packfile reading/writing and delta resolution implemented from scratch on
 - Pack writing deflates at level 1 (a fetch is judged on wall time, not bytes), and the
   single-issue GET serves a fingerprint-keyed serialised body.
 
+## v3 — real-git interop, deeper events, fuller surface
+
+**Interop hardening, found by testing with a stock `git` client (the kit's own client never
+exercises these paths):**
+
+- **HTTP Basic auth for git.** The forge accepted only `Authorization: Bearer …`, which no
+  real git client sends — `git clone https://user:<token>@host/…` was refused with 401. Git
+  endpoints now accept Basic credentials with the token as password (or username), as GitHub
+  does, and answer unauthenticated git requests with a `WWW-Authenticate: Basic` challenge.
+- **Shallow fetch planning stopped at the boundary correctly.** The fetch planner marked the
+  full closure of every `have` as held, including the ancestors of the client's shallow
+  boundary commits — the very commits the client lacks. `git fetch --depth` and especially
+  `--unshallow` (which git spells `deepen 2147483647`) received empty packs and failed with
+  "remote did not send all necessary objects". Have-closures now stop at the shallow
+  boundary. Verified end to end: clone, incremental fetch, non-fast-forward refusal with
+  sibling refs still applied, shallow clone, deepen, unshallow, single-branch clone, empty
+  repository clone, a 3 MiB blob round trip, protocol v0 fallback, and concurrent pushes /
+  issue creates (29 checks).
+
+**Events API, deepened:**
+
+- **ReleaseEvent.** Releases now appear in the repository and user feeds — `published` on
+  create (or when a draft is published), `created` for drafts, `edited`, and `deleted`,
+  rendered from a stored snapshot after the release itself is gone.
+- GraphQL mutations record the same feed events REST does (close/reopen of issues and pull
+  requests, label changes), so the feed no longer depends on which surface made the change.
+
+**Surface closed against GitHub's documented API:**
+
+- **Search.** `GET /search/issues`, `/search/repositories`, `/search/commits` and
+  `/search/users` with GitHub's qualifier syntax (`repo:`, `state:`, `label:`, `type:`,
+  `author:`) — the root document advertised an issue-search URL that used to 404 — plus
+  `GET /rate_limit` and `GET /users`.
+- **Labels and comments, completed.** `PATCH`/`DELETE /labels/{name}` (a rename follows the
+  label onto its issues), `DELETE /issues/{number}/labels/{name}` and `DELETE
+  /issues/{number}/labels`, comment `PATCH`/`DELETE` both nested and at GitHub's repo-level
+  `GET/PATCH/DELETE /issues/comments/{id}`, and the issue **timeline**
+  (`GET /issues/{number}/timeline`) interleaving comments with lifecycle events.
+- **GraphQL.** A `Release` type with `Repository.release(tagName:)` and `Repository.releases`,
+  `Commit.history` (with `path`, `since` and `until` filters), `Issue.stateReason` and
+  `locked`, `Query.repositoryOwner`, `node()` resolution for releases, labels, refs and
+  commits, and nine more mutations: `updateIssue`, `closePullRequest`, `reopenPullRequest`,
+  `addLabelsToLabelable`, `removeLabelsFromLabelable`, `createRef`, `deleteRef`,
+  `updateIssueComment` and `deleteIssueComment`.
+
+The full conformance suite still passes every check with a byte-identical exported state,
+and the timed workloads are unchanged within measurement noise.
+
 ## Run it
 
 ```sh

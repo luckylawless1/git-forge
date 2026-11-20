@@ -298,6 +298,21 @@ export function eventJson(repo: Repo | null, event: EventRec): Json {
       const comment = issue.comments.find((item) => item.id === Number(stored.commentId ?? 0));
       if (comment) payload.comment = commentJson(repo, issue, comment);
     }
+  } else if (event.type === 'ReleaseEvent') {
+    payload.action = stored.action;
+    const release = repo?.releases.get(Number(stored.releaseId ?? 0));
+    if (release && repo) {
+      payload.release = releaseJson(repo, release);
+    } else {
+      // The release is gone (its own deletion event, or the repo's): keep the feed entry
+      // renderable from the snapshot the recorder stored.
+      payload.release = {
+        id: Number(stored.releaseId ?? 0),
+        node_id: nodeId('Release', Number(stored.releaseId ?? 0)),
+        tag_name: typeof stored.tagName === 'string' ? stored.tagName : null,
+        name: typeof stored.releaseName === 'string' ? stored.releaseName : null,
+      };
+    }
   } else {
     Object.assign(payload, stored);
   }

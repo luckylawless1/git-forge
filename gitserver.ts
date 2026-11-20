@@ -230,10 +230,31 @@ function planFetch(repo: Repo, args: V2Args): FetchPlan {
       collectReachable(store, [parseCommit(commit.data).tree], exclude);
     }
   };
-  for (const have of args.haves) {
-    if (clientShallow.has(have)) excludeShallowCommit(have);
-    else collectReachable(store, [have], exclude);
-  }
+  // A have's closure stops at the client's shallow boundary: the ancestors of a shallow
+  // commit are exactly what the client does NOT hold, so marking them held (as a plain
+  // closure walk through the boundary commit would) makes a deepen or --unshallow fetch
+  // (git spells the latter "deepen 2147483647") send an empty pack and strand the client.
+  const excludeClosure = (root: string): void => {
+    const stack = [root];
+    while (stack.length) {
+      const oid = stack.pop() as string;
+      if (exclude.has(oid)) continue;
+      const object = store.get(oid);
+      if (!object) continue;
+      exclude.add(oid);
+      if (object.type === 'commit') {
+        const commit = parseCommit(object.data);
+        stack.push(commit.tree);
+        if (!clientShallow.has(oid)) for (const parent of commit.parents) stack.push(parent);
+      } else if (object.type === 'tree') {
+        stack.push(...treeChildren(store, oid));
+      } else if (object.type === 'tag') {
+        const target = tagTarget(object.data);
+        if (target) stack.push(target);
+      }
+    }
+  };
+  for (const have of args.haves) excludeClosure(have);
   for (const oid of clientShallow) if (!exclude.has(oid)) excludeShallowCommit(oid);
   for (const not of args.deepenNot) collectReachable(store, [not], exclude);
   const depth = args.deepen;

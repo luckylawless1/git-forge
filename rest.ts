@@ -13,7 +13,7 @@ import {
   peelToCommit,
 } from './git.ts';
 import { diffTrees, planMerge } from './diff.ts';
-import { recordIssueEvent, recordRefUpdate } from './events.ts';
+import { recordIssueEvent, recordRefUpdate, recordReleaseEvent } from './events.ts';
 import { addCommentRecord, branchFiles, commitFiles, createIssueRecord, createPullRecord, mergePull, viewerIdentLine } from './ops.ts';
 import {
   commentJson,
@@ -115,6 +115,104 @@ export function resolveCommit(repo: Repo, name: string | null | undefined): stri
   return object ? name : null;
 }
 
+/** Split a search query into free-text terms and key:value qualifiers. */
+function parseSearchQuery(raw: string): { terms: string[]; qualifiers: Map<string, string[]> } {
+  const terms: string[] = [];
+  const qualifiers = new Map<string, string[]>();
+  for (const token of raw.split(/\s+/).filter(Boolean)) {
+    const colon = token.indexOf(':');
+    if (colon > 0 && !token.startsWith('http')) {
+      const key = token.slice(0, colon).toLowerCase();
+      const value = token.slice(colon + 1);
+      const list = qualifiers.get(key) ?? [];
+      list.push(value);
+      qualifiers.set(key, list);
+    } else {
+      terms.push(token.toLowerCase());
+    }
+  }
+  return { terms, qualifiers };
+}
+
+function searchResult<T>(req: RestRequest, items: T[], path: string): RestResult {
+  const { page, headers } = paginate(req, items, path);
+  return { status: 200, body: { total_count: items.length, incomplete_results: false, items: page }, headers };
+}
+
+/**
+ * The search endpoints the root document advertises: issues (and pull requests),
+ * repositories, commits and users, with GitHub's qualifier syntax for the filters the
+ * forge can answer honestly (repo:, state:, label:, type:, author:/user:).
+ */
+function searchRoutes(req: RestRequest): RestResult {
+  if (req.method !== 'GET' || req.parts.length !== 2) return notFound();
+  const kind = req.parts[1];
+  const { terms, qualifiers } = parseSearchQuery(req.query.get('q') ?? '');
+  const matchesText = (text: string): boolean => terms.every((term) => text.toLowerCase().includes(term));
+  const repoFilter = qualifiers.get('repo')?.[0]?.toLowerCase();
+  const inScope = (repo: Repo): boolean => !repoFilter || repo.fullName.toLowerCase() === repoFilter;
+  if (kind === 'issues') {
+    const state = qualifiers.get('state')?.[0];
+    const type = qualifiers.get('type')?.[0];
+    const author = (qualifiers.get('author')?.[0] ?? qualifiers.get('user')?.[0])?.toLowerCase();
+    const wantedLabels = (qualifiers.get('label') ?? []).map((label) => label.toLowerCase());
+    const found: Array<{ repo: Repo; issue: IssueRec }> = [];
+    for (const repo of forge.listRepos()) {
+      if (!inScope(repo)) continue;
+      for (const issue of repo.issues.values()) {
+        if (state && issue.state !== state) continue;
+        if (type === 'issue' && issue.pull) continue;
+        if (type === 'pr' && !issue.pull) continue;
+        if (author && issue.userLogin.toLowerCase() !== author) continue;
+        if (!wantedLabels.every((label) => issue.labels.some((name) => name.toLowerCase() === label))) continue;
+        if (!matchesText(`${issue.title}\n${issue.body ?? ''}`)) continue;
+        found.push({ repo, issue });
+      }
+    }
+    found.sort((a, b) => b.issue.createdAt.getTime() - a.issue.createdAt.getTime());
+    if ((req.query.get('order') ?? 'desc') === 'asc') found.reverse();
+    return searchResult(req, found.map(({ repo, issue }) => issueJson(repo, issue)), '/api/v3/search/issues');
+  }
+  if (kind === 'repositories') {
+    const user = (qualifiers.get('user')?.[0] ?? qualifiers.get('owner')?.[0])?.toLowerCase();
+    const found = forge.listRepos().filter((repo) => {
+      if (user && repo.owner.toLowerCase() !== user) return false;
+      return matchesText(`${repo.name} ${repo.description}`);
+    });
+    found.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+    if ((req.query.get('order') ?? 'desc') === 'asc') found.reverse();
+    return searchResult(req, found.map((repo) => repoJson(repo)), '/api/v3/search/repositories');
+  }
+  if (kind === 'commits') {
+    const author = (qualifiers.get('author')?.[0])?.toLowerCase();
+    const items: Json[] = [];
+    for (const repo of forge.listRepos()) {
+      if (!inScope(repo)) continue;
+      const seen = new Set<string>();
+      for (const tip of repo.refs.values()) {
+        const start = peelToCommit(repo.objects, tip);
+        if (!start) continue;
+        for (const sha of repo.listCommits(start, 1000)) {
+          if (seen.has(sha)) continue;
+          seen.add(sha);
+          const rendered = commitJson(repo, sha);
+          if (!rendered) continue;
+          const commit = rendered.commit as { message?: string; author?: { email?: string; name?: string } };
+          if (author && (commit.author?.email ?? '').toLowerCase() !== author && (commit.author?.name ?? '').toLowerCase() !== author) continue;
+          if (!matchesText(commit.message ?? '')) continue;
+          items.push({ ...(rendered as Record<string, unknown>), repository: repoJson(repo), score: 1.0 } as unknown as Json);
+        }
+      }
+    }
+    return searchResult(req, items, '/api/v3/search/commits');
+  }
+  if (kind === 'users') {
+    const found = matchesText(VIEWER_LOGIN) || terms.length === 0 ? [viewerJson()] : [];
+    return searchResult(req, found, '/api/v3/search/users');
+  }
+  return notFound();
+}
+
 export function handleRest(req: RestRequest): RestResult {
   const { parts } = req;
   if (parts.length === 0) {
@@ -123,8 +221,13 @@ export function handleRest(req: RestRequest): RestResult {
         status: 200,
         body: {
           current_user_url: `${req.base}/api/v3/user`,
+          current_user_repositories_url: `${req.base}/api/v3/user/repos{?type,page,per_page,sort}`,
           repository_url: `${req.base}/api/v3/repos/{owner}/{repo}`,
+          repository_search_url: `${req.base}/api/v3/search/repositories?q={query}{&page,per_page,sort,order}`,
+          commit_search_url: `${req.base}/api/v3/search/commits?q={query}{&page,per_page,sort,order}`,
           issue_search_url: `${req.base}/api/v3/search/issues?q={query}{&page,per_page,sort,order}`,
+          user_search_url: `${req.base}/api/v3/search/users?q={query}{&page,per_page,sort,order}`,
+          rate_limit_url: `${req.base}/api/v3/rate_limit`,
           _links: {
             user: { href: `${req.base}/api/v3/user` },
             meta: { href: `${req.base}/api/v3/meta` },
@@ -133,6 +236,25 @@ export function handleRest(req: RestRequest): RestResult {
       };
     }
     return notFound();
+  }
+  if (parts[0] === 'rate_limit' && parts.length === 1 && req.method === 'GET') {
+    const reset = Math.floor(Date.now() / 1000) + 3600;
+    const bucket = { limit: 5000, remaining: 5000, reset, used: 0 };
+    return {
+      status: 200,
+      body: {
+        resources: {
+          core: bucket,
+          search: { limit: 30, remaining: 30, reset, used: 0 },
+          graphql: { limit: 5000, remaining: 5000, reset, used: 0 },
+        },
+        rate: bucket,
+      },
+    };
+  }
+  if (parts[0] === 'search') return searchRoutes(req);
+  if (parts[0] === 'users' && parts.length === 1 && req.method === 'GET') {
+    return { status: 200, body: [viewerJson()] };
   }
   if (parts[0] === 'meta' && parts.length === 1 && req.method === 'GET') {
     return {
@@ -837,6 +959,7 @@ function releaseRoutes(req: RestRequest, repo: Repo, rest: string[]): RestResult
         publishedAt: draft ? null : now,
       };
       repo.releases.set(release.id, release);
+      recordReleaseEvent(forge, repo, draft ? 'created' : 'published', release);
       return { status: 201, body: releaseJson(repo, release) };
     }
     return notFound();
@@ -846,6 +969,7 @@ function releaseRoutes(req: RestRequest, repo: Repo, rest: string[]): RestResult
     if (!release) return notFound();
     if (req.method === 'GET') return { status: 200, body: releaseJson(repo, release) };
     if (req.method === 'PATCH') {
+      const wasDraft = release.draft;
       const tagName = bodyString(req.body, 'tag_name');
       if (tagName !== undefined) release.tagName = tagName;
       const target = bodyString(req.body, 'target_commitish');
@@ -857,9 +981,11 @@ function releaseRoutes(req: RestRequest, repo: Repo, rest: string[]): RestResult
         if (!release.draft && release.publishedAt === null) release.publishedAt = nowDate();
       }
       if (typeof req.body?.prerelease === 'boolean') release.prerelease = req.body.prerelease;
+      recordReleaseEvent(forge, repo, wasDraft && !release.draft ? 'published' : 'edited', release);
       return { status: 200, body: releaseJson(repo, release) };
     }
     if (req.method === 'DELETE') {
+      recordReleaseEvent(forge, repo, 'deleted', release);
       repo.releases.delete(release.id);
       return { status: 204 };
     }
@@ -888,6 +1014,30 @@ function labelRoutes(req: RestRequest, repo: Repo, rest: string[]): RestResult {
     const label = repo.labels.get(decodeURIComponent(rest[0]));
     if (!label) return notFound();
     if (req.method === 'GET') return { status: 200, body: labelJson(repo, label) };
+    if (req.method === 'PATCH') {
+      const newName = bodyString(req.body, 'new_name');
+      if (newName && newName !== label.name) {
+        if (repo.labels.has(newName)) return unprocessable('Validation Failed', [{ resource: 'Label', code: 'already_exists', field: 'name' }]);
+        repo.labels.delete(label.name);
+        // A rename follows the label onto every issue carrying it, as on GitHub.
+        for (const issue of repo.issues.values()) {
+          issue.labels = issue.labels.map((name) => (name === label.name ? newName : name));
+        }
+        label.name = newName;
+        repo.labels.set(newName, label);
+      }
+      const color = bodyString(req.body, 'color');
+      if (color !== undefined) label.color = color.replace(/^#/, '');
+      if (req.body && 'description' in req.body) label.description = bodyString(req.body, 'description') ?? null;
+      return { status: 200, body: labelJson(repo, label) };
+    }
+    if (req.method === 'DELETE') {
+      repo.labels.delete(label.name);
+      for (const issue of repo.issues.values()) {
+        if (issue.labels.includes(label.name)) issue.labels = issue.labels.filter((name) => name !== label.name);
+      }
+      return { status: 204 };
+    }
   }
   return notFound();
 }
@@ -922,6 +1072,32 @@ function issueRoutes(req: RestRequest, repo: Repo, rest: string[]): RestResult {
     if (req.method === 'GET') {
       const { page, headers } = paginate(req, sortedIssues(repo, req, false), `/api/v3/repos/${repo.fullName}/issues`);
       return { status: 200, body: page.map((issue) => issueJson(repo, issue)), headers };
+    }
+    return notFound();
+  }
+  if (rest[0] === 'comments') {
+    // GitHub also addresses a comment directly under the repo: /issues/comments/{id}.
+    if (rest.length !== 2) return notFound();
+    const commentId = Number(rest[1]);
+    if (!Number.isInteger(commentId)) return notFound();
+    for (const candidate of repo.issues.values()) {
+      const comment = candidate.comments.find((item) => item.id === commentId);
+      if (!comment) continue;
+      if (req.method === 'GET') return { status: 200, body: commentJson(repo, candidate, comment) };
+      if (req.method === 'PATCH') {
+        const body = bodyString(req.body, 'body');
+        if (body === undefined) return unprocessable('Validation Failed', [{ resource: 'IssueComment', code: 'missing_field', field: 'body' }]);
+        comment.body = body;
+        comment.updatedAt = nowDate();
+        candidate.updatedAt = nowDate();
+        return { status: 200, body: commentJson(repo, candidate, comment) };
+      }
+      if (req.method === 'DELETE') {
+        candidate.comments = candidate.comments.filter((item) => item.id !== commentId);
+        candidate.updatedAt = nowDate();
+        return { status: 204 };
+      }
+      return notFound();
     }
     return notFound();
   }
@@ -985,6 +1161,23 @@ function issueRoutes(req: RestRequest, repo: Repo, rest: string[]): RestResult {
       headers,
     };
   }
+  if (rest[1] === 'timeline' && rest.length === 2 && req.method === 'GET') {
+    // The timeline interleaves the comments themselves with the lifecycle events, oldest
+    // first; the IssueCommentEvent entries are represented by their comments, not repeated.
+    const items: Array<{ at: number; body: Json }> = [];
+    for (const comment of issue.comments) {
+      items.push({ at: comment.createdAt.getTime(), body: commentJson(repo, issue, comment) });
+    }
+    for (const event of forge.events) {
+      if (event.repoFullName !== repo.fullName || Number(event.payload.issueNumber ?? -1) !== number) continue;
+      if (event.type === 'IssueCommentEvent') continue;
+      const rendered = issueEventJson(repo, event);
+      if (rendered) items.push({ at: event.createdAt.getTime(), body: rendered });
+    }
+    items.sort((a, b) => a.at - b.at);
+    const { page, headers } = paginate(req, items, `/api/v3/repos/${repo.fullName}/issues/${number}/timeline`);
+    return { status: 200, body: page.map((item) => item.body), headers };
+  }
   if (rest[1] === 'comments') {
     if (rest.length === 2 && req.method === 'GET') {
       return { status: 200, body: issue.comments.map((comment) => commentJson(repo, issue, comment)) };
@@ -998,6 +1191,23 @@ function issueRoutes(req: RestRequest, repo: Repo, rest: string[]): RestResult {
     if (rest.length === 3 && req.method === 'GET') {
       const comment = issue.comments.find((item) => item.id === Number(rest[2]));
       return comment ? { status: 200, body: commentJson(repo, issue, comment) } : notFound();
+    }
+    if (rest.length === 3 && req.method === 'PATCH') {
+      const comment = issue.comments.find((item) => item.id === Number(rest[2]));
+      if (!comment) return notFound();
+      const body = bodyString(req.body, 'body');
+      if (body === undefined) return unprocessable('Validation Failed', [{ resource: 'IssueComment', code: 'missing_field', field: 'body' }]);
+      comment.body = body;
+      comment.updatedAt = nowDate();
+      issue.updatedAt = nowDate();
+      return { status: 200, body: commentJson(repo, issue, comment) };
+    }
+    if (rest.length === 3 && req.method === 'DELETE') {
+      const commentId = Number(rest[2]);
+      if (!issue.comments.some((item) => item.id === commentId)) return notFound();
+      issue.comments = issue.comments.filter((item) => item.id !== commentId);
+      issue.updatedAt = nowDate();
+      return { status: 204 };
     }
   }
   if (rest[1] === 'labels') {
@@ -1016,6 +1226,21 @@ function issueRoutes(req: RestRequest, repo: Repo, rest: string[]): RestResult {
       }
       issue.updatedAt = nowDate();
       return { status: 200, body: issue.labels.map((name) => repo.labels.get(name)).filter(Boolean).map((label) => labelJson(repo, label as NonNullable<typeof label>)) };
+    }
+    if (req.method === 'DELETE' && rest.length === 3) {
+      const name = decodeURIComponent(rest[2]);
+      if (issue.labels.includes(name)) {
+        issue.labels = issue.labels.filter((item) => item !== name);
+        recordIssueEvent(forge, repo, 'unlabeled', issue, name);
+        issue.updatedAt = nowDate();
+      }
+      return { status: 200, body: issue.labels.map((labelName) => repo.labels.get(labelName)).filter(Boolean).map((label) => labelJson(repo, label as NonNullable<typeof label>)) };
+    }
+    if (req.method === 'DELETE' && rest.length === 2) {
+      for (const name of issue.labels) recordIssueEvent(forge, repo, 'unlabeled', issue, name);
+      issue.labels = [];
+      issue.updatedAt = nowDate();
+      return { status: 204 };
     }
   }
   return notFound();

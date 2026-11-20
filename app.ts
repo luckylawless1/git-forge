@@ -55,6 +55,25 @@ function jsonReply(status: number, value: unknown, headers?: Record<string, stri
 
 const notFound = (): Reply => jsonReply(404, { message: 'Not Found' });
 
+/**
+ * Whether an Authorization header authenticates: the bearer form the kit's clients use, or
+ * the HTTP Basic form real git clients send — the token as the password under any username,
+ * or as the username — which is how GitHub accepts token auth for git over HTTPS.
+ */
+function tokenAccepted(authorization: string, token: string): boolean {
+  if (authorization === `Bearer ${token}`) return true;
+  if (!authorization.startsWith('Basic ')) return false;
+  let decoded: string;
+  try {
+    decoded = Buffer.from(authorization.slice('Basic '.length), 'base64').toString('utf8');
+  } catch {
+    return false;
+  }
+  const separator = decoded.indexOf(':');
+  if (separator < 0) return decoded === token;
+  return decoded.slice(separator + 1) === token || decoded.slice(0, separator) === token;
+}
+
 async function dispatch(req: IncomingMessage, body: Buffer): Promise<Reply> {
   const url = new URL(req.url ?? '/', 'http://forge.invalid');
   const path = url.pathname;
@@ -68,8 +87,14 @@ async function dispatch(req: IncomingMessage, body: Buffer): Promise<Reply> {
 
   const expectedToken = process.env.MAKEFUN_SHOP_TOKEN ?? '';
   const authorization = req.headers.authorization ?? '';
-  if (expectedToken !== '' && authorization !== `Bearer ${expectedToken}`) {
-    return jsonReply(401, { message: 'Bad credentials' });
+  if (expectedToken !== '' && !tokenAccepted(authorization, expectedToken)) {
+    const reply = jsonReply(401, { message: 'Bad credentials' });
+    // Git endpoints answer with a Basic challenge, as GitHub does, so a real git client
+    // prompts for (or retries with) credentials instead of failing outright.
+    if (path.endsWith('/info/refs') || path.endsWith('/git-upload-pack') || path.endsWith('/git-receive-pack')) {
+      reply.headers = { 'WWW-Authenticate': 'Basic realm="git"' };
+    }
+    return reply;
   }
 
   // MCP answers its own JSON-RPC errors (including -32700 parse errors) from the raw body.
